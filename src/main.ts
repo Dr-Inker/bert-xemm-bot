@@ -1,3 +1,4 @@
+import { writeFile } from 'node:fs/promises';
 import { loadConfig } from './config.js';
 import { logger } from './logger.js';
 import { StateStore } from './stateStore.js';
@@ -141,9 +142,28 @@ async function main(): Promise<void> {
   const fillLoop = new FillLoop(cex, hedgeExec, logger);
   const wdLoop = new WatchdogLoop(watchdog, cfg.watchdog.cadenceMs, logger);
 
+  // Observer mode must NEVER place orders. Override CEX placeLimit at runtime so the
+  // quoter can still compute intents and log them via basis_samples, but never submit.
+  if (cfg.mode === 'observer') {
+    const origPlace = cex.placeLimit.bind(cex);
+    cex.placeLimit = async (_p) => {
+      logger.info({ mode: 'observer' }, 'placeLimit suppressed in observer mode');
+      return 'OBSERVER-NO-OP';
+    };
+    void origPlace; // retained for symmetry; never used while mode === observer
+  }
+
   const quoterTimer = setInterval(() => {
     quoter.tick().catch(e => logger.error({ err: e }, 'quoter tick'));
   }, cfg.quoter.cadenceMs);
+
+  // Heartbeat ticker — touches the file every 5s so ops/heartbeat-check.sh sees
+  // a fresh mtime. Independent of the three main loops so any one of them
+  // hanging still surfaces as a heartbeat-stale alert at the next 5s tick.
+  const heartbeatTimer = setInterval(() => {
+    writeFile(cfg.paths.heartbeat, new Date().toISOString())
+      .catch(err => logger.warn({ err }, 'heartbeat write failed'));
+  }, 5_000);
 
   if (cfg.mode !== 'observer') {
     fillLoop.run().catch(e => logger.error({ err: e }, 'fillLoop crashed'));
@@ -153,6 +173,7 @@ async function main(): Promise<void> {
   process.on('SIGINT', () => {
     logger.info('SIGINT received, shutting down');
     clearInterval(quoterTimer);
+    clearInterval(heartbeatTimer);
     wdLoop.stop();
     fillLoop.shutdown();
     process.exit(0);
