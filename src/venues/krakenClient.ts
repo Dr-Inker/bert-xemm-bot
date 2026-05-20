@@ -59,7 +59,13 @@ export class KrakenClient implements HedgeVenue {
     await this.runJson<unknown>(['order', 'cancel-after', String(seconds)]);
   }
 
-  amend(_p: AmendParams): Promise<void> { throw new Error('amend not implemented yet (Task 7)'); }
+  async amend(p: AmendParams): Promise<void> {
+    const clamped = Math.max(2, Math.min(60, Math.floor(p.deadlineSec)));
+    const args = ['order', 'amend', '--txid', p.venueOrderId, '--deadline', `+${clamped}s`];
+    if (p.price !== undefined) { args.push('--limit-price', p.price.toString()); }
+    if (p.volume !== undefined) { args.push('--order-qty', p.volume.toString()); }
+    await this.runJson<unknown>(args);
+  }
   watchExecutions(): AsyncIterable<Fill> { throw new Error('watchExecutions not implemented yet (Task 8)'); }
   watchOrders(): AsyncIterable<OrderUpdate> { throw new Error('not implemented yet (Task 8)'); }
   watchBook(_p: string, _d: number): AsyncIterable<BookSnapshot> { throw new Error('not implemented yet (Task 8)'); }
