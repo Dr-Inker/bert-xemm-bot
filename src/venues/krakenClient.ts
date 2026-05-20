@@ -1,6 +1,7 @@
 import Decimal from 'decimal.js';
 import { execFileNoThrow } from '../utils/execFileNoThrow.js';
 import { mapKrakenError } from './krakenErrors.js';
+import { spawnKrakenStream, ndjsonLines } from './krakenStream.js';
 import { VenueError, type HedgeVenue, type PlaceLimitParams, type AmendParams } from './hedgeVenue.js';
 import type { Fill, OrderUpdate, BookSnapshot, Order, FeeTier } from '../types.js';
 
@@ -66,9 +67,67 @@ export class KrakenClient implements HedgeVenue {
     if (p.volume !== undefined) { args.push('--order-qty', p.volume.toString()); }
     await this.runJson<unknown>(args);
   }
-  watchExecutions(): AsyncIterable<Fill> { throw new Error('watchExecutions not implemented yet (Task 8)'); }
-  watchOrders(): AsyncIterable<OrderUpdate> { throw new Error('not implemented yet (Task 8)'); }
-  watchBook(_p: string, _d: number): AsyncIterable<BookSnapshot> { throw new Error('not implemented yet (Task 8)'); }
+  async *watchExecutions(): AsyncIterable<Fill> {
+    const child = spawnKrakenStream(this.cfg.cliBinaryPath, [...this.base(), 'ws', 'executions']);
+    try {
+      for await (const event of ndjsonLines(child)) {
+        const ev = event as { channel?: string; data?: { exec_type?: string; order_id?: string; symbol?: string; side?: 'buy'|'sell'; last_qty?: string; last_price?: string; fees?: { qty?: string }[]; timestamp?: string; exec_id?: string } };
+        if (ev?.channel !== 'executions' || ev.data?.exec_type !== 'trade') continue;
+        const d = ev.data;
+        if (!d.order_id || !d.side || !d.last_qty || !d.last_price || !d.exec_id || !d.timestamp) continue;
+        const fee = d.fees?.[0]?.qty ?? '0';
+        yield {
+          fillId: d.exec_id,
+          orderClOrdId: d.order_id,
+          side: d.side,
+          price: new Decimal(d.last_price),
+          volume: new Decimal(d.last_qty),
+          fee: new Decimal(fee),
+          t: new Date(d.timestamp),
+        };
+      }
+    } finally { child.kill(); }
+  }
+
+  async *watchOrders(): AsyncIterable<OrderUpdate> {
+    const child = spawnKrakenStream(this.cfg.cliBinaryPath, [...this.base(), 'ws', 'executions']);
+    try {
+      for await (const event of ndjsonLines(child)) {
+        const ev = event as { channel?: string; data?: { exec_type?: string; order_id?: string; order_status?: string; cum_qty?: string; timestamp?: string } };
+        if (ev?.channel !== 'executions') continue;
+        const d = ev.data;
+        if (!d?.order_id || !d.order_status || !d.timestamp) continue;
+        const statusMap: Record<string, OrderUpdate['status']> = {
+          new: 'open', open: 'open', cancelled: 'cancelled', filled: 'filled', partially_filled: 'partially_filled', rejected: 'rejected',
+        };
+        const status = statusMap[d.order_status] ?? 'open';
+        yield {
+          venueOrderId: d.order_id,
+          status,
+          filledVolume: new Decimal(d.cum_qty ?? '0'),
+          t: new Date(d.timestamp),
+        };
+      }
+    } finally { child.kill(); }
+  }
+
+  async *watchBook(pair: string, depth: number): AsyncIterable<BookSnapshot> {
+    const child = spawnKrakenStream(this.cfg.cliBinaryPath, [...this.base(), 'ws', 'book', pair, '--depth', String(depth)]);
+    try {
+      for await (const event of ndjsonLines(child)) {
+        const ev = event as { channel?: string; data?: { symbol?: string; bids?: { price: string; qty: string }[]; asks?: { price: string; qty: string }[]; timestamp?: string } };
+        if (ev?.channel !== 'book' || !ev.data) continue;
+        const d = ev.data;
+        if (!d.bids || !d.asks || !d.symbol || !d.timestamp) continue;
+        yield {
+          pair: d.symbol,
+          bids: d.bids.map(l => ({ price: new Decimal(l.price), volume: new Decimal(l.qty) })),
+          asks: d.asks.map(l => ({ price: new Decimal(l.price), volume: new Decimal(l.qty) })),
+          t: new Date(d.timestamp),
+        };
+      }
+    } finally { child.kill(); }
+  }
   balances(): Promise<{ base: Decimal; quote: Decimal }> { throw new Error('not implemented yet (Task 9)'); }
   openOrders(): Promise<Order[]> { throw new Error('not implemented yet (Task 9)'); }
   feeTier(): Promise<FeeTier> { throw new Error('not implemented yet (Task 9)'); }
