@@ -1,0 +1,40 @@
+{
+  "name": "bert-xemm-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22.0.0" },
+  "packageManager": "pnpm@9.0.0",
+  "scripts": {
+    "build": "tsc -p .",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "lint": "tsc --noEmit",
+    "start": "node --enable-source-maps dist/main.js",
+    "cli": "tsx src/cli/index.ts"
+  },
+  "dependencies": {
+    "@solana/spl-token": "^0.4.9",
+    "@solana/web3.js": "^1.95.0",
+    "better-sqlite3": "^11.3.0",
+    "bn.js": "^5.2.1",
+    "bs58": "^6.0.0",
+    "commander": "^12.1.0",
+    "decimal.js": "^10.4.3",
+    "dotenv": "^16.4.5",
+    "pino": "^9.4.0",
+    "yaml": "^2.5.1",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/bn.js": "^5.1.6",
+    "@types/node": "^22.7.4",
+    "@vitest/coverage-v8": "^2.1.2",
+    "tsx": "^4.19.1",
+    "typescript": "^5.6.2",
+    "vitest": "^2.1.2",
+    "fast-check": "^3.22.0"
+  }
+}
