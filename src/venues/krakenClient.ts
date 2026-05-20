@@ -128,7 +128,38 @@ export class KrakenClient implements HedgeVenue {
       }
     } finally { child.kill(); }
   }
-  balances(): Promise<{ base: Decimal; quote: Decimal }> { throw new Error('not implemented yet (Task 9)'); }
-  openOrders(): Promise<Order[]> { throw new Error('not implemented yet (Task 9)'); }
-  feeTier(): Promise<FeeTier> { throw new Error('not implemented yet (Task 9)'); }
+  async balances(): Promise<{ base: Decimal; quote: Decimal }> {
+    const j = await this.runJson<Record<string, string>>(['account', 'balance']);
+    const base = j['BERT'] ?? j['XBT'] ?? '0';
+    const quote = j['ZUSD'] ?? j['USD'] ?? '0';
+    return { base: new Decimal(base), quote: new Decimal(quote) };
+  }
+
+  async openOrders(): Promise<Order[]> {
+    const j = await this.runJson<{ open?: Record<string, { descr: { type: 'buy'|'sell'; price: string; pair: string }; vol: string; vol_exec: string; status: string; opentm: number; userref?: number }> }>(['account', 'open-orders']);
+    const out: Order[] = [];
+    for (const [venueOrderId, o] of Object.entries(j.open ?? {})) {
+      const statusMap: Record<string, Order['status']> = {
+        open: 'open', cancelled: 'cancelled', closed: 'filled', expired: 'cancelled', pending: 'open',
+      };
+      out.push({
+        clOrdId: String(o.userref ?? venueOrderId),
+        venueOrderId,
+        side: o.descr.type,
+        price: new Decimal(o.descr.price),
+        volume: new Decimal(o.vol),
+        status: statusMap[o.status] ?? 'open',
+        placedAt: new Date(o.opentm * 1000),
+      });
+    }
+    return out;
+  }
+
+  async feeTier(): Promise<FeeTier> {
+    const j = await this.runJson<{ fees?: Record<string, { fee_maker?: string; fee?: string }> }>(['volume', '--pair', this.cfg.pair]);
+    const k = this.cfg.pair;
+    const maker = j.fees?.[k]?.fee_maker ?? '0.16';
+    const taker = j.fees?.[k]?.fee ?? '0.26';
+    return { makerBps: Math.round(parseFloat(maker) * 100), takerBps: Math.round(parseFloat(taker) * 100) };
+  }
 }
