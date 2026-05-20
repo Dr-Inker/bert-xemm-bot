@@ -1,0 +1,101 @@
+# bert-xemm-bot example configuration
+#
+# Copy to /etc/bert-xemm-bot/config.yaml (mode 0640, owner bertxemm:bertxemm).
+# Sensitive fields (Kraken API key/secret, Telegram bot token, hot wallet
+# keyfile) are loaded via env vars or separate files — never inline secrets
+# in this YAML.
+
+# Phase gate. Lifecycle: observer -> paper -> live.
+#   observer: read-only, log decisions, no orders
+#   paper:    place orders on Kraken paper, simulate Raydium hedges
+#   live:     real orders both venues
+mode: observer
+
+# Master switch. Set to false to stop quoting without uninstalling the service.
+enabled: true
+
+kraken:
+  # Trading pair (Kraken altname or wsname).
+  pair: BERTUSD
+  # Path to the Kraken CLI binary used by KrakenClient.
+  cliBinaryPath: /usr/local/bin/kraken
+  # Names of the env vars that hold the API credentials. The CLI reads these.
+  apiKeyEnv: KRAKEN_API_KEY
+  apiSecretEnv: KRAKEN_API_SECRET
+  # How often to refresh the cached maker/taker fee tier (seconds).
+  feeTierRefreshSec: 3600
+
+raydium:
+  # BERT/SOL AMM pool address on Solana mainnet.
+  poolAddress: BmsZE6TkZYskyS1PatPKRyyazGdxWFxdia4BuvLg9AgY
+  # Operator chooses provider (Helius / Triton / QuickNode / public). Public
+  # mainnet-beta is fine for observer + paper; switch to a paid endpoint
+  # before live phase.
+  rpcUrl: https://api.mainnet-beta.solana.com
+  # Jito block engine hostname for bundle submission.
+  jitoBlockEngine: mainnet.block-engine.jito.wtf
+
+jupiter:
+  baseUrl: https://quote-api.jup.ag/v6
+  # Max slippage tolerated on Jupiter swap quotes (bps). Hard-capped at 1000.
+  maxSlippageBps: 50
+
+quoter:
+  # Decision loop cadence (ms). Min 500, max 60_000.
+  cadenceMs: 2500
+  # Half-spread we target above the DEX mid (bps).
+  bufferBps: 80
+  # Re-quote when the new target moves more than this many bps from the
+  # current resting order.
+  driftThresholdBps: 15
+  # Linear inventory-skew coefficient: bps of bias per $1 of net inventory.
+  inventorySkewBpsPerUsd: 0.05
+  # Do not quote if expected round-trip edge after fees is below this (bps).
+  minEdgeBps: 50
+
+inventory:
+  # Hard cap on absolute net delta across venues (USD). Tripping this is
+  # kill-condition #1 — see watchdog.conditions.netDeltaUsd.
+  maxNetUsd: 500
+
+watchdog:
+  # Watchdog cadence (ms). Independent of quoter loop. Min 1000, max 60_000.
+  cadenceMs: 5000
+  conditions:
+    # Kill if |net delta| > this (USD).
+    netDeltaUsd: 500
+    # Kill if daily PnL drops below this (percent of book — must be negative).
+    dailyPnlPct: -2
+    # Kill if Raydium pool 24h volume falls below this (USD).
+    raydium24hMinUsd: 20000
+    # Kill if Kraken pair 24h volume falls below this (USD).
+    kraken24hMinUsd: 20000
+    # Kill if SOL/USD moves more than this percent in any 1h window (abs).
+    solUsd1hMaxAbsPct: 5
+    # Halt if RPC calls/minute exceeds this (rate-limit guard).
+    rpcCallsPerMinHalt: 120
+    # Kill if rolling adverse-fill rate exceeds this (0..1).
+    adverseFillRateMax: 0.8
+    # Kill if any feed is stale for more than this many seconds.
+    staleDataSeconds: 30
+
+# Oracle: kill if two price sources diverge by more than this (bps).
+oracleDivergenceBps: 200
+
+# Global RPC rate limit (calls/sec) for the Solana side.
+maxRpcCallsPerSec: 5
+
+paths:
+  # SQLite state DB (orders, fills, positions, kill events).
+  state: /var/lib/bert-xemm-bot/state.db
+  # Heartbeat file touched each loop — systemd watchdog tails this.
+  heartbeat: /var/lib/bert-xemm-bot/heartbeat
+  # Solana hot wallet keyfile (mode 0600, owner bertxemm).
+  keyfile: /etc/bert-xemm-bot/hot-wallet.json
+
+notifier:
+  # Optional. Omit either block to disable that channel.
+  telegram:
+    botTokenEnv: TELEGRAM_BOT_TOKEN
+    chatId: '...'                          # numeric chat id as a string
+  discordWebhookUrl: https://discord.com/api/webhooks/.../...
