@@ -128,6 +128,19 @@ export class StateStore {
     return r?.value ?? null;
   }
 
+  basisSamplesSince(iso: string): Array<{ t: string; raydiumMidUsd: string; krakenBid: string; krakenAsk: string; solUsd: string; wouldHaveActed: boolean }> {
+    const rows = this.db.prepare(`
+      SELECT t, raydium_mid_usd AS raydiumMidUsd, kraken_bid AS krakenBid, kraken_ask AS krakenAsk, sol_usd AS solUsd, would_have_acted AS wouldHaveActed
+      FROM basis_samples WHERE t >= ? ORDER BY t ASC
+    `).all(iso) as Array<{ t: string; raydiumMidUsd: string; krakenBid: string; krakenAsk: string; solUsd: string; wouldHaveActed: number }>;
+    return rows.map(r => ({ ...r, wouldHaveActed: r.wouldHaveActed === 1 }));
+  }
+
+  countFillsSince(iso: string): number {
+    const r = this.db.prepare(`SELECT COUNT(*) AS n FROM fills WHERE t >= ?`).get(iso) as { n: number };
+    return r.n;
+  }
+
   withTransaction<T>(fn: () => T): T {
     const tx = this.db.transaction(fn);
     return tx();
