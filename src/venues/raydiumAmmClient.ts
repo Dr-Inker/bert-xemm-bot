@@ -1,5 +1,6 @@
 import Decimal from 'decimal.js';
 import type { DexVenue, PoolMid, SwapQuote, Asset } from './dexVenue.js';
+import { MINT, DECIMALS, jupiterQuote, jupiterBuildSwap, type QuoteResp } from './jupiterApi.js';
 
 export interface RaydiumAmmConfig {
   poolAddress: string;
@@ -10,6 +11,7 @@ export interface RaydiumAmmConfig {
 export interface RpcAdapter {
   getPoolState(poolAddress: string): Promise<{ baseVault: string; quoteVault: string; baseDecimals: number; quoteDecimals: number }>;
   getTokenBalance(account: string): Promise<{ uiAmount: string; amount: string; decimals: number }>;
+  getWalletBalances(): Promise<{ bert: string; sol: string }>;
 }
 
 export interface SolRefAdapter {
@@ -47,13 +49,29 @@ export class RaydiumAmmClient implements DexVenue {
     return { mid, solUsd, asOf: new Date() };
   }
 
-  estimateSwap(_i: Asset, _o: Asset, _a: Decimal): Promise<SwapQuote> {
-    throw new Error('estimateSwap not implemented yet (Task 13)');
+  async estimateSwap(input: Asset, output: Asset, amountIn: Decimal): Promise<SwapQuote> {
+    const inputMint = MINT[input];
+    const outputMint = MINT[output];
+    const amount = amountIn.mul(new Decimal(10).pow(DECIMALS[input])).toFixed(0);
+    const q = await jupiterQuote({
+      inputMint, outputMint, amount, slippageBps: this.quoterSlippageBps, baseUrl: this.jupiterBaseUrl,
+    });
+    const outDecimals = DECIMALS[output];
+    const expectedOut = new Decimal(q.outAmount).div(new Decimal(10).pow(outDecimals));
+    return {
+      inputAsset: input, outputAsset: output, amountIn, expectedAmountOut: expectedOut,
+      slippageBps: q.slippageBps, routeJson: JSON.stringify(q),
+    };
   }
-  submitSwap(_q: SwapQuote, _o: { jito: boolean; tipLamports: number }): Promise<string> {
-    throw new Error('submitSwap not implemented yet (Task 13)');
+
+  async submitSwap(quote: SwapQuote, opts: { jito: boolean; tipLamports: number }): Promise<string> {
+    const q = JSON.parse(quote.routeJson) as QuoteResp;
+    const built = await jupiterBuildSwap(this.jupiterBaseUrl, q, this.hotWalletPubkey);
+    return this.submitter.submitProtected(built.swapTransaction, opts);
   }
-  walletBalances(): Promise<{ bert: Decimal; sol: Decimal }> {
-    throw new Error('walletBalances not implemented yet (Task 13)');
+
+  async walletBalances(): Promise<{ bert: Decimal; sol: Decimal }> {
+    const b = await this.rpc.getWalletBalances();
+    return { bert: new Decimal(b.bert), sol: new Decimal(b.sol) };
   }
 }
