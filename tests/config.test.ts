@@ -1,14 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { loadConfig, BotConfigSchema } from '../src/config.js';
+import { loadConfig, BotConfigSchema, type BotConfig } from '../src/config.js';
 import { writeFileSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-describe('config', () => {
-  it('parses a minimal valid config', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'cfg-'));
-    const p = join(dir, 'cfg.yaml');
-    writeFileSync(p, `
+const VALID_YAML = `
 mode: paper
 enabled: true
 kraken:
@@ -51,18 +47,30 @@ paths:
   keyfile: /tmp/keyfile.json
 notifier:
   discordWebhookUrl: https://example.com/hook
-`);
-    const cfg = loadConfig(p);
+`;
+
+function validConfig(): BotConfig {
+  const dir = mkdtempSync(join(tmpdir(), 'cfg-'));
+  const p = join(dir, 'cfg.yaml');
+  writeFileSync(p, VALID_YAML);
+  return loadConfig(p);
+}
+
+describe('config', () => {
+  it('parses a minimal valid config', () => {
+    const cfg = validConfig();
     expect(cfg.mode).toBe('paper');
     expect(cfg.quoter.cadenceMs).toBe(2500);
     expect(cfg.watchdog.conditions.netDeltaUsd).toBe(500);
   });
 
-  it('rejects invalid mode', () => {
-    expect(() => BotConfigSchema.parse({ mode: 'bogus' })).toThrow();
+  it('rejects invalid mode (with otherwise-valid config)', () => {
+    const base = validConfig();
+    expect(() => BotConfigSchema.parse({ ...base, mode: 'bogus' })).toThrow();
   });
 
-  it('rejects negative bufferBps', () => {
-    expect(() => BotConfigSchema.parse({ quoter: { bufferBps: -10 } })).toThrow();
+  it('rejects negative bufferBps (with otherwise-valid config)', () => {
+    const base = validConfig();
+    expect(() => BotConfigSchema.parse({ ...base, quoter: { ...base.quoter, bufferBps: -10 } })).toThrow();
   });
 });
