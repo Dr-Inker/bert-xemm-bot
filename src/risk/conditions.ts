@@ -26,3 +26,23 @@ export function condKraken24hMin(s: { kraken24hVolUsd: Decimal }, t: { kraken24h
   const tripped = s.kraken24hVolUsd.lt(t.kraken24hMinUsd);
   return { tripped, reason: tripped ? `kraken24h=${s.kraken24hVolUsd.toString()} < ${t.kraken24hMinUsd}` : undefined, action: 'reduce_only_stop_quoting' };
 }
+
+export function condSolUsd1hMove(s: { pctMove1h: number }, t: { solUsd1hMaxAbsPct: number }): KillResult {
+  const tripped = Math.abs(s.pctMove1h) > t.solUsd1hMaxAbsPct;
+  return { tripped, reason: tripped ? `solUsd1hMove=${s.pctMove1h}% > +/-${t.solUsd1hMaxAbsPct}%` : undefined, action: 'pause_new_mark_to_market' };
+}
+
+export function condRpcBurn(s: { callsPerMin: number }, t: { rpcCallsPerMinHalt: number }): KillResult {
+  const tripped = s.callsPerMin > t.rpcCallsPerMinHalt;
+  return { tripped, reason: tripped ? `rpc=${s.callsPerMin}/min > ${t.rpcCallsPerMinHalt}` : undefined, action: 'halt_rpc' };
+}
+
+export function condAdverseFill(s: { adverseShareLast20: number }, t: { adverseFillRateMax: number }): KillResult {
+  const tripped = s.adverseShareLast20 > t.adverseFillRateMax;
+  return { tripped, reason: tripped ? `adverse=${(s.adverseShareLast20*100).toFixed(0)}% > ${(t.adverseFillRateMax*100).toFixed(0)}%` : undefined, action: 'withdraw_30min' };
+}
+
+export function condStaleData(s: { oldestSourceAgeSec: number }, t: { staleDataSeconds: number }): KillResult {
+  const tripped = s.oldestSourceAgeSec > t.staleDataSeconds;
+  return { tripped, reason: tripped ? `staleSec=${s.oldestSourceAgeSec} > ${t.staleDataSeconds}` : undefined, action: 'cancel_all_refuse_resume' };
+}
