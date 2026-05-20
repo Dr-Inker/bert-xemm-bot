@@ -11,9 +11,13 @@ function baseInput(overrides: Partial<QuoterInput> = {}): QuoterInput {
     inventory: { bertNet: new Decimal('0'), usdNet: new Decimal('0'), asOf: new Date() },
     feeTier: { makerBps: 16, takerBps: 26 },
     dexCostBps: 25 + 10,
+    // Profitability math (default-input config):
+    //   bufferBps - (makerBps + dexCostBps) = 130 - (16 + 35) = 79
+    //   79 >= minEdgeBps(20) → profitable, place
+    // Test 3 overrides bufferBps=40, dropping net edge to -11 → skip.
     config: {
-      bufferBps: 80, driftThresholdBps: 15, inventorySkewBpsPerUsd: 0.05,
-      minEdgeBps: 50, maxInventoryUsd: 500, defaultVolumeBert: new Decimal('1000'),
+      bufferBps: 130, driftThresholdBps: 15, inventorySkewBpsPerUsd: 0.05,
+      minEdgeBps: 20, maxInventoryUsd: 500, defaultVolumeBert: new Decimal('1000'),
     } satisfies QuoterConfig,
     ...overrides,
   };
@@ -32,20 +36,24 @@ describe('decideQuotes', () => {
     expect(out.every((i: QuoteIntent) => i.action !== 'place')).toBe(true);
   });
 
-  it('skips a side whose profitability gate fails (bufferBps too tight)', () => {
-    const out = decideQuotes(baseInput({ config: { ...baseInput().config, bufferBps: 40, minEdgeBps: 50 } }));
+  it('skips both sides when bufferBps cannot clear net edge over costs', () => {
+    // bufferBps=40, costs=(16+35)=51, net=-11; well under any positive minEdgeBps.
+    const out = decideQuotes(baseInput({ config: { ...baseInput().config, bufferBps: 40 } }));
     expect(out.filter((i: QuoteIntent) => i.action === 'place')).toHaveLength(0);
   });
 
   it('skews quotes when inventory is long (widens bid, tightens ask)', () => {
+    // bufferBps=130 default; usdNet=354 × skewCoeff 0.05 = 17.7 bps skew.
+    // Bid total = 130 + 17.7 = 147.7 bps below mid 0.0177 → 0.017439
+    // Ask total = 130 - 17.7 = 112.3 bps above mid → 0.017899
     const out = decideQuotes(baseInput({
       inventory: { bertNet: new Decimal('20000'), usdNet: new Decimal('354'), asOf: new Date() },
     }));
     const bid = out.find((i: QuoteIntent) => i.action === 'place' && i.side === 'buy');
     const ask = out.find((i: QuoteIntent) => i.action === 'place' && i.side === 'sell');
     if (bid && bid.action === 'place' && ask && ask.action === 'place') {
-      expect(bid.price.lt('0.01756')).toBe(true);
-      expect(ask.price.lt('0.01784')).toBe(true);
+      expect(bid.price.lt('0.01745')).toBe(true);
+      expect(ask.price.lt('0.01790')).toBe(true);
     } else {
       throw new Error('expected both place intents');
     }

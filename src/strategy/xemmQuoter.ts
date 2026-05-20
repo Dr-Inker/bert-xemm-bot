@@ -50,12 +50,8 @@ export function decideQuotes(input: QuoterInput): QuoteIntent[] {
   for (const side of ['buy', 'sell'] as const) {
     const skew = skewBps(input.inventory.usdNet, side, input.config.inventorySkewBpsPerUsd);
     const totalBps = input.config.bufferBps + skew;
-    // Profitability gate: configured spread floor must clear minEdgeBps.
-    // expectedRtBps is informational (round-trip fee accounting) but the test
-    // contract compares bufferBps directly against minEdgeBps.
-    const _expectedRtBps = input.feeTier.makerBps + input.dexCostBps;
-    void _expectedRtBps;
-    if (input.config.bufferBps < input.config.minEdgeBps) continue;
+    const expectedRtBps = input.feeTier.makerBps + input.dexCostBps;
+    if (input.config.bufferBps - expectedRtBps < input.config.minEdgeBps) continue;
 
     if (side === 'buy' && longCapped) continue;
     if (side === 'sell' && shortCapped) continue;
