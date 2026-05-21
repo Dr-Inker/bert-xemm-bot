@@ -10,6 +10,7 @@ import { JupiterSolRef } from '../venues/solRefAdapter.js';
 import { JitoClient } from '../jitoClient.js';
 import { TxSubmitter } from '../txSubmitter.js';
 import { Notifier } from '../notifier.js';
+import { RpcCounter } from '../utils/rpcCounter.js';
 import type { HedgeVenue } from '../venues/hedgeVenue.js';
 import type { DexVenue } from '../venues/dexVenue.js';
 
@@ -22,6 +23,7 @@ export interface WiredVenues {
   dex: DexVenue;
   notifier: Notifier;
   connection: Connection;
+  rpcCounter: RpcCounter;
 }
 
 export function wireVenues(configPath?: string): WiredVenues {
@@ -51,8 +53,9 @@ export function wireVenues(configPath?: string): WiredVenues {
   const signer = { sign: async <T>(tx: T): Promise<T> => tx };
   const submitter = new TxSubmitter({ connection, jito, signer: signer as never });
 
+  const rpcCounter = new RpcCounter();
   const rpc = new SolanaRpcAdapter({
-    connection, poolAddress: cfg.raydium.poolAddress, bertMint: BERT_MINT,
+    connection, poolAddress: cfg.raydium.poolAddress, bertMint: BERT_MINT, rpcCounter,
     // hotWalletPubkey: undefined for now — Phase 3 reads the keyfile. Wallet zeros are OK for observer/paper.
   });
   const solRef = new JupiterSolRef();
@@ -61,5 +64,5 @@ export function wireVenues(configPath?: string): WiredVenues {
     rpc, solRef, submitter, '', cfg.jupiter.baseUrl, cfg.jupiter.maxSlippageBps,
   );
 
-  return { cfg, store, cex, dex, notifier, connection };
+  return { cfg, store, cex, dex, notifier, connection, rpcCounter };
 }

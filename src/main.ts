@@ -11,8 +11,10 @@ import Decimal from 'decimal.js';
 import { BookCache } from './venues/bookCache.js';
 import { NetDeltaTracker } from './strategy/netDeltaTracker.js';
 import { trustedMid } from './priceOracle.js';
+import { Raydium24hVol } from './venues/raydium24hVol.js';
 import {
   condNetDelta, condKraken24hMin, condSolUsd1hMove, condStaleData,
+  condRpcBurn, condRaydium24hMin,
   type KillResult,
 } from './risk/conditions.js';
 
@@ -59,7 +61,7 @@ class Kraken24hVol {
 }
 
 async function main(): Promise<void> {
-  const { cfg, store, cex, dex, notifier } = wireVenues();
+  const { cfg, store, cex, dex, notifier, connection, rpcCounter } = wireVenues();
   logger.info({ mode: cfg.mode, enabled: cfg.enabled }, 'startup');
 
   const reconciler = new Reconciler({
@@ -73,17 +75,33 @@ async function main(): Promise<void> {
   const ok = await reconciler.run();
   if (!ok) { logger.error('reconciler refused startup'); process.exit(1); }
 
-  // HedgeExecutor v1 persistence stub: logger-only hedge state. Full schema in Task 25.
+  // HedgeExecutor wired against StateStore + Solana RPC txStatus adapter.
+  // Spec section 5.5: poll getSignatureStatus every 2s up to 30s, then retry up to 3x.
   const hedgeExec = new HedgeExecutor({
     dex,
     store: {
-      writeHedge: async (r) => { logger.info({ hedge: r }, 'hedge state'); },
-      readInFlight: async () => new Decimal('0'),
-      markConfirmed: async () => { /* persistence stub for v1 */ },
+      writeHedge: async (r) => { store.insertHedgeRow(r); },
+      readInFlight: async () => store.sumInFlightHedgesBert(),
+      markConfirmed: async (hedgeId, txSig, slippageRealized) => {
+        store.markHedgeConfirmed(hedgeId, txSig, slippageRealized);
+      },
     },
     notifier: { page: (m) => { void notifier.critical(m); } },
     maxDexSlippageBps: cfg.jupiter.maxSlippageBps,
     jitoTipLamports: 10_000,
+    txStatus: async (sig) => {
+      try {
+        const r = await connection.getSignatureStatus(sig);
+        const v = r.value;
+        if (!v) return 'pending';
+        if (v.err) return 'failed';
+        if (v.confirmationStatus === 'confirmed' || v.confirmationStatus === 'finalized') return 'confirmed';
+        return 'pending';
+      } catch (err) {
+        logger.warn({ err, sig }, 'txStatus poll failed; treating as pending');
+        return 'pending';
+      }
+    },
   });
 
   const tracker = new NetDeltaTracker();
@@ -93,6 +111,7 @@ async function main(): Promise<void> {
 
   const solUsdHist = new SolUsdHistory();
   const kraken24h = new Kraken24hVol(cfg.kraken.pair);
+  const raydium24h = new Raydium24hVol({ poolAddress: cfg.raydium.poolAddress, logger });
 
   const evaluateConditions = async (): Promise<KillResult[]> => {
     const out: KillResult[] = [];
@@ -103,7 +122,7 @@ async function main(): Promise<void> {
       const dexBal = await dex.walletBalances();
       const inv = tracker.snapshot({
         kraken: balances, dex: dexBal,
-        inFlightHedgesBert: new Decimal('0'), midUsd: mid.mid,
+        inFlightHedgesBert: store.sumInFlightHedgesBert(), midUsd: mid.mid,
       });
 
       out.push(condNetDelta({ usdNet: inv.usdNet }, { netDeltaUsd: cfg.watchdog.conditions.netDeltaUsd }));
@@ -116,11 +135,20 @@ async function main(): Promise<void> {
       const ageSec = (Date.now() - mid.asOf.getTime()) / 1000;
       out.push(condStaleData({ oldestSourceAgeSec: ageSec }, { staleDataSeconds: cfg.watchdog.conditions.staleDataSeconds }));
 
-      // Deferred conditions (not evaluated in v1.1 — need infrastructure):
-      //   condDailyPnl: needs running PnL tracker (TODO).
-      //   condRaydium24hMin: needs DexScreener trailing volume aggregator (TODO).
-      //   condRpcBurn: needs RPC call counter (TODO).
-      //   condAdverseFill: needs post-fill price movement tracker (TODO).
+      out.push(condRpcBurn(
+        { callsPerMin: rpcCounter.callsPerMin() },
+        { rpcCallsPerMinHalt: cfg.watchdog.conditions.rpcCallsPerMinHalt },
+      ));
+
+      const rayVol = await raydium24h.fetch();
+      out.push(condRaydium24hMin(
+        { raydium24hVolUsd: rayVol },
+        { raydium24hMinUsd: cfg.watchdog.conditions.raydium24hMinUsd },
+      ));
+
+      // 6 of 8 conditions now wired. Remaining deferred (need additional infrastructure):
+      //   condDailyPnl: needs running PnL tracker.
+      //   condAdverseFill: needs post-fill price-movement tracker.
     } catch (err) {
       logger.error({ err }, 'watchdog evaluate failed; returning empty (open)');
     }
@@ -155,7 +183,7 @@ async function main(): Promise<void> {
       const dexBal = await dex.walletBalances();
       const snap = tracker.snapshot({
         kraken: balances, dex: dexBal,
-        inFlightHedgesBert: new Decimal('0'), midUsd: mid.mid,
+        inFlightHedgesBert: store.sumInFlightHedgesBert(), midUsd: mid.mid,
       });
       const fee = await cex.feeTier();
       return {

@@ -9,6 +9,9 @@ export interface SolanaRpcAdapterOpts {
   // Cache TTLs to limit RPC + HTTP burn
   poolStateCacheMs?: number;
   balanceCacheMs?: number;
+  // Optional call counter — incremented before every Solana RPC call (NOT
+  // DexScreener fetches). Feeds the condRpcBurn watchdog condition.
+  rpcCounter?: { incr(): void };
 }
 
 interface PoolState { baseVault: string; quoteVault: string; baseDecimals: number; quoteDecimals: number }
@@ -68,6 +71,7 @@ export class SolanaRpcAdapter implements RpcAdapter {
 
     // Regular path: read token account via @solana/web3.js
     const pubkey = new PublicKey(account);
+    this.opts.rpcCounter?.incr();
     const r = await this.opts.connection.getTokenAccountBalance(pubkey);
     const value = {
       uiAmount: r.value.uiAmountString ?? '0',
@@ -88,6 +92,8 @@ export class SolanaRpcAdapter implements RpcAdapter {
       return value;
     }
     const wallet = new PublicKey(this.opts.hotWalletPubkey);
+    this.opts.rpcCounter?.incr();
+    this.opts.rpcCounter?.incr();
     const [solLamports, splAccounts] = await Promise.all([
       this.opts.connection.getBalance(wallet),
       this.opts.connection.getParsedTokenAccountsByOwner(wallet, { mint: new PublicKey(this.opts.bertMint) }),
