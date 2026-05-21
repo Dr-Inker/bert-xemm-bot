@@ -81,4 +81,102 @@ describe('HedgeExecutor.onFill', () => {
     const amountIn = call[2] as Decimal;
     expect(parseFloat(amountIn.toFixed(4))).toBeCloseTo(0.2056, 3);
   });
+
+  it('happy path: poll returns confirmed → markConfirmed called', async () => {
+    vi.useFakeTimers();
+    const dex = {
+      estimateSwap: vi.fn().mockResolvedValue({
+        inputAsset: 'BERT', outputAsset: 'SOL', amountIn: new Decimal('1000'),
+        expectedAmountOut: new Decimal('0.0045'), slippageBps: 50, priceImpactBps: 10, routeJson: '{}',
+      }),
+      submitSwap: vi.fn().mockResolvedValue('SIG-CONFIRM'),
+    };
+    const markConfirmed = vi.fn();
+    const transitions: string[] = [];
+    const store = {
+      writeHedge: vi.fn((r: { status: string }) => { transitions.push(r.status); }),
+      readInFlight: vi.fn().mockResolvedValue(new Decimal('0')),
+      markConfirmed,
+    };
+    const txStatus = vi.fn().mockResolvedValue('confirmed');
+    const exec = new HedgeExecutor({
+      dex: dex as never, store: store as never,
+      notifier: { page: vi.fn() } as never,
+      maxDexSlippageBps: 100, jitoTipLamports: 10_000,
+      txStatus, pollIntervalMs: 50, pollTimeoutMs: 1_000,
+    });
+    const p = exec.onFill(fill, new Decimal('86.12'));
+    await vi.runAllTimersAsync();
+    await p;
+    expect(markConfirmed).toHaveBeenCalledWith(expect.any(String), 'SIG-CONFIRM', '10');
+    expect(transitions).toContain('intent_queued');
+    expect(transitions).toContain('tx_submitted');
+    vi.useRealTimers();
+  });
+
+  it('retry path: 1 timeout then confirmed → 2 submissions, no dead-letter', async () => {
+    vi.useFakeTimers();
+    const dex = {
+      estimateSwap: vi.fn().mockResolvedValue({
+        inputAsset: 'BERT', outputAsset: 'SOL', amountIn: new Decimal('1000'),
+        expectedAmountOut: new Decimal('0.0045'), slippageBps: 50, priceImpactBps: 10, routeJson: '{}',
+      }),
+      submitSwap: vi.fn()
+        .mockResolvedValueOnce('SIG-1')
+        .mockResolvedValueOnce('SIG-2'),
+    };
+    const markConfirmed = vi.fn();
+    const transitions: string[] = [];
+    const store = {
+      writeHedge: vi.fn((r: { status: string }) => { transitions.push(r.status); }),
+      readInFlight: vi.fn().mockResolvedValue(new Decimal('0')),
+      markConfirmed,
+    };
+    // First sig: pending forever (times out). Second sig: confirmed.
+    const txStatus = vi.fn((sig: string) => Promise.resolve(sig === 'SIG-1' ? 'pending' : 'confirmed'));
+    const exec = new HedgeExecutor({
+      dex: dex as never, store: store as never,
+      notifier: { page: vi.fn() } as never,
+      maxDexSlippageBps: 100, jitoTipLamports: 10_000,
+      txStatus: txStatus as never, pollIntervalMs: 50, pollTimeoutMs: 200,
+    });
+    const p = exec.onFill(fill, new Decimal('86.12'));
+    await vi.runAllTimersAsync();
+    await p;
+    expect(dex.submitSwap).toHaveBeenCalledTimes(2);
+    expect(transitions).toContain('failed_will_retry');
+    expect(markConfirmed).toHaveBeenCalledWith(expect.any(String), 'SIG-2', '10');
+    vi.useRealTimers();
+  });
+
+  it('dead-letter: 3 retries exhausted', async () => {
+    vi.useFakeTimers();
+    const dex = {
+      estimateSwap: vi.fn().mockResolvedValue({
+        inputAsset: 'BERT', outputAsset: 'SOL', amountIn: new Decimal('1000'),
+        expectedAmountOut: new Decimal('0.0045'), slippageBps: 50, priceImpactBps: 10, routeJson: '{}',
+      }),
+      submitSwap: vi.fn().mockResolvedValue('SIG-X'),
+    };
+    const transitions: string[] = [];
+    const store = {
+      writeHedge: vi.fn((r: { status: string }) => { transitions.push(r.status); }),
+      readInFlight: vi.fn().mockResolvedValue(new Decimal('0')),
+      markConfirmed: vi.fn(),
+    };
+    const txStatus = vi.fn().mockResolvedValue('failed');
+    const notifier = { page: vi.fn() };
+    const exec = new HedgeExecutor({
+      dex: dex as never, store: store as never,
+      notifier: notifier as never,
+      maxDexSlippageBps: 100, jitoTipLamports: 10_000,
+      txStatus, pollIntervalMs: 50, pollTimeoutMs: 200, maxRetries: 3,
+    });
+    const p = exec.onFill(fill, new Decimal('86.12'));
+    await vi.runAllTimersAsync();
+    await p;
+    expect(transitions).toContain('failed_dead_letter');
+    expect(notifier.page).toHaveBeenCalled();
+    vi.useRealTimers();
+  });
 });

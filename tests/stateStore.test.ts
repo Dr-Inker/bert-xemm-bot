@@ -53,6 +53,15 @@ describe('StateStore', () => {
     expect(rows[0]!.action_taken).toBe('cancel_all_reduce_only');
   });
 
+  it('sumInFlightHedgesBert sums non-terminal hedges', () => {
+    store.insertHedgeRow({ hedgeId:'h1', triggeringFillId:'f1', status:'tx_submitted', jupiterQuote:null, txSig:'s1', slippageRealized:null, bertNotional:'1000', tIntent:'2026-05-21T00:00:00Z', tConfirmed:null });
+    store.insertHedgeRow({ hedgeId:'h2', triggeringFillId:'f2', status:'swap_quoted',  jupiterQuote:null, txSig:null, slippageRealized:null, bertNotional:'500',  tIntent:'2026-05-21T00:00:00Z', tConfirmed:null });
+    store.insertHedgeRow({ hedgeId:'h3', triggeringFillId:'f3', status:'confirmed',    jupiterQuote:null, txSig:'s3', slippageRealized:'10', bertNotional:'200',  tIntent:'2026-05-21T00:00:00Z', tConfirmed:'2026-05-21T00:01:00Z' });
+    store.insertHedgeRow({ hedgeId:'h4', triggeringFillId:'f4', status:'slippage_aborted', jupiterQuote:null, txSig:null, slippageRealized:'200', bertNotional:'750', tIntent:'2026-05-21T00:00:00Z', tConfirmed:null });
+    const total = store.sumInFlightHedgesBert();
+    expect(total.toString()).toBe('1500');
+  });
+
   it('listOpenOrders returns only orders with status=open', () => {
     store.insertOrder({
       clOrdId: 'cl-open-1', krakenTxid: 'O1', side: 'buy',

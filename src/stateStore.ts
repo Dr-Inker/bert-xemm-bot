@@ -1,5 +1,6 @@
 import Database from 'better-sqlite3';
 import type { Database as DB } from 'better-sqlite3';
+import Decimal from 'decimal.js';
 
 export interface OrderRow {
   clOrdId: string;
@@ -58,6 +59,7 @@ export class StateStore {
         jupiter_quote TEXT,
         tx_sig TEXT,
         slippage_realized TEXT,
+        bert_notional TEXT,
         t_intent TEXT NOT NULL,
         t_confirmed TEXT
       );
@@ -82,6 +84,9 @@ export class StateStore {
         value TEXT NOT NULL
       );
     `);
+    // Idempotent column add for DBs created before bert_notional existed.
+    // SQLite errors if the column is already present; swallow safely.
+    try { this.db.exec("ALTER TABLE hedges ADD COLUMN bert_notional TEXT"); } catch { /* column already exists */ }
   }
 
   insertOrder(r: OrderRow): void {
@@ -155,6 +160,45 @@ export class StateStore {
       INSERT INTO kill_events (t, condition_id, snapshot_json, action_taken)
       VALUES (@t, @conditionId, @snapshotJson, @actionTaken)
     `).run(r);
+  }
+
+  insertHedgeRow(r: {
+    hedgeId: string; triggeringFillId: string; status: string;
+    jupiterQuote: string | null; txSig: string | null; slippageRealized: string | null;
+    bertNotional: string; tIntent: string; tConfirmed: string | null;
+  }): void {
+    this.db.prepare(`
+      INSERT INTO hedges (hedge_id, triggering_fill_id, status, jupiter_quote, tx_sig, slippage_realized, bert_notional, t_intent, t_confirmed)
+      VALUES (@hedgeId, @triggeringFillId, @status, @jupiterQuote, @txSig, @slippageRealized, @bertNotional, @tIntent, @tConfirmed)
+      ON CONFLICT(hedge_id) DO UPDATE SET
+        status=excluded.status,
+        jupiter_quote=excluded.jupiter_quote,
+        tx_sig=excluded.tx_sig,
+        slippage_realized=excluded.slippage_realized,
+        bert_notional=excluded.bert_notional,
+        t_confirmed=excluded.t_confirmed
+    `).run(r);
+  }
+
+  markHedgeConfirmed(hedgeId: string, txSig: string, slippageRealized: string): void {
+    this.db.prepare(`
+      UPDATE hedges SET status='confirmed', tx_sig=?, slippage_realized=?, t_confirmed=?
+      WHERE hedge_id=?
+    `).run(txSig, slippageRealized, new Date().toISOString(), hedgeId);
+  }
+
+  markHedgeFailed(hedgeId: string, status: string): void {
+    this.db.prepare(`UPDATE hedges SET status=? WHERE hedge_id=?`).run(status, hedgeId);
+  }
+
+  sumInFlightHedgesBert(): Decimal {
+    const rows = this.db.prepare(`
+      SELECT bert_notional FROM hedges
+      WHERE status IN ('intent_queued','swap_quoted','tx_submitted','failed_will_retry')
+    `).all() as Array<{ bert_notional: string | null }>;
+    let total = new Decimal(0);
+    for (const r of rows) if (r.bert_notional) total = total.plus(new Decimal(r.bert_notional));
+    return total;
   }
 
   withTransaction<T>(fn: () => T): T {
