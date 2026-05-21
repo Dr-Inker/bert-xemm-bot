@@ -8,6 +8,7 @@ import { FillLoop } from './orchestrator/fillLoop.js';
 import { WatchdogLoop } from './orchestrator/watchdogLoop.js';
 import { wireVenues } from './orchestrator/wire.js';
 import Decimal from 'decimal.js';
+import { BookCache } from './venues/bookCache.js';
 import { NetDeltaTracker } from './strategy/netDeltaTracker.js';
 import { trustedMid } from './priceOracle.js';
 import {
@@ -87,6 +88,9 @@ async function main(): Promise<void> {
 
   const tracker = new NetDeltaTracker();
 
+  const bookCache = new BookCache(cfg.kraken.pair, logger);
+  bookCache.run(cex, cfg.kraken.pair, 10).catch(e => logger.error({ err: e }, 'bookCache run crashed'));
+
   const solUsdHist = new SolUsdHistory();
   const kraken24h = new Kraken24hVol(cfg.kraken.pair);
 
@@ -157,7 +161,7 @@ async function main(): Promise<void> {
       return {
         ref: { raydiumMidUsd: mid.mid, solUsd: mid.solUsd, asOf: mid.asOf },
         oracleTrusted: trust.trusted,
-        krakenBook: { pair: cfg.kraken.pair, bids: [], asks: [], t: new Date() },
+        krakenBook: bookCache.snapshot(),
         openOrders: await cex.openOrders(),
         inventory: snap,
         feeTier: fee,
@@ -212,6 +216,7 @@ async function main(): Promise<void> {
     clearInterval(heartbeatTimer);
     wdLoop.stop();
     fillLoop.shutdown();
+    bookCache.shutdown();
     process.exit(0);
   });
 }
