@@ -12,9 +12,11 @@ import { BookCache } from './venues/bookCache.js';
 import { NetDeltaTracker } from './strategy/netDeltaTracker.js';
 import { trustedMid } from './priceOracle.js';
 import { Raydium24hVol } from './venues/raydium24hVol.js';
+import { PnlTracker } from './strategy/pnlTracker.js';
+import { AdverseFillTracker } from './strategy/adverseFillTracker.js';
 import {
   condNetDelta, condKraken24hMin, condSolUsd1hMove, condStaleData,
-  condRpcBurn, condRaydium24hMin,
+  condRpcBurn, condRaydium24hMin, condDailyPnl, condAdverseFill,
   type KillResult,
 } from './risk/conditions.js';
 
@@ -113,6 +115,29 @@ async function main(): Promise<void> {
   const kraken24h = new Kraken24hVol(cfg.kraken.pair);
   const raydium24h = new Raydium24hVol({ poolAddress: cfg.raydium.poolAddress, logger });
 
+  const pnl = new PnlTracker();
+  const adverseFill = new AdverseFillTracker({
+    postFillDelayMs: 5 * 60_000,
+    getMidUsd: async () => (await dex.poolMidUsd()).mid,
+  });
+
+  // Bootstrap pnl day-start once we have inventory.
+  void (async () => {
+    try {
+      const mid = await dex.poolMidUsd();
+      const balances = await cex.balances();
+      const dexBal = await dex.walletBalances();
+      const inv = tracker.snapshot({
+        kraken: balances, dex: dexBal,
+        inFlightHedgesBert: store.sumInFlightHedgesBert(),
+        midUsd: mid.mid,
+      });
+      pnl.initDayStart(inv.bertNet, mid.mid, balances.quote, new Date());
+    } catch (err) {
+      logger.warn({ err }, 'pnl day-start bootstrap failed; using zeros');
+    }
+  })();
+
   const evaluateConditions = async (): Promise<KillResult[]> => {
     const out: KillResult[] = [];
     try {
@@ -146,9 +171,18 @@ async function main(): Promise<void> {
         { raydium24hMinUsd: cfg.watchdog.conditions.raydium24hMinUsd },
       ));
 
-      // 6 of 8 conditions now wired. Remaining deferred (need additional infrastructure):
-      //   condDailyPnl: needs running PnL tracker.
-      //   condAdverseFill: needs post-fill price-movement tracker.
+      const pnlSnap = pnl.snapshot(inv.bertNet, mid.mid, new Date());
+      out.push(condDailyPnl(
+        { pnlPct: pnlSnap.totalPct },
+        { dailyPnlPct: cfg.watchdog.conditions.dailyPnlPct },
+      ));
+
+      out.push(condAdverseFill(
+        { adverseShareLast20: adverseFill.adverseShareLast20() },
+        { adverseFillRateMax: cfg.watchdog.conditions.adverseFillRateMax },
+      ));
+
+      // 8 of 8 conditions now wired.
     } catch (err) {
       logger.error({ err }, 'watchdog evaluate failed; returning empty (open)');
     }
@@ -207,7 +241,11 @@ async function main(): Promise<void> {
     logger,
   });
 
-  const fillLoop = new FillLoop(cex, hedgeExec, logger, async () => (await dex.poolMidUsd()).solUsd);
+  const fillLoop = new FillLoop(
+    cex, hedgeExec, logger,
+    async () => (await dex.poolMidUsd()).solUsd,
+    (f) => { pnl.recordFill(f); adverseFill.recordFill(f); },
+  );
   const wdLoop = new WatchdogLoop(watchdog, cfg.watchdog.cadenceMs, logger);
 
   // Observer mode must NEVER place orders. Override CEX placeLimit at runtime so the
@@ -245,6 +283,7 @@ async function main(): Promise<void> {
     wdLoop.stop();
     fillLoop.shutdown();
     bookCache.shutdown();
+    adverseFill.shutdown();
     process.exit(0);
   });
 }
