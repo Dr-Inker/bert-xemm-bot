@@ -60,7 +60,9 @@ export class RaydiumAmmClient implements DexVenue {
     const expectedOut = new Decimal(q.outAmount).div(new Decimal(10).pow(outDecimals));
     return {
       inputAsset: input, outputAsset: output, amountIn, expectedAmountOut: expectedOut,
-      slippageBps: q.slippageBps, routeJson: JSON.stringify(q),
+      slippageBps: q.slippageBps,
+      priceImpactBps: Math.round(parseFloat(q.priceImpactPct) * 10_000),
+      routeJson: JSON.stringify(q),
     };
   }
 

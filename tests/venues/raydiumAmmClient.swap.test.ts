@@ -20,6 +20,7 @@ describe('RaydiumAmmClient swap path', () => {
     const c = new RaydiumAmmClient({ poolAddress: 'P', rpcUrl: 'mock://', jitoBlockEngine: 'mock://' }, rpc as never, solRef as never, submitter as never);
     const q = await c.estimateSwap('BERT', 'SOL', new Decimal('1000'));
     expect(q.expectedAmountOut.gt(0)).toBe(true);
+    expect(q.priceImpactBps).toBe(10);
     const args = spy.mock.calls[0]![0];
     expect(args.inputMint).toBe('HgBRWfYxEfvPhtqkaeymCQtHCrKE46qQ43pKe8HCpump');
     expect(args.outputMint).toBe('So11111111111111111111111111111111111111112');
@@ -30,7 +31,7 @@ describe('RaydiumAmmClient swap path', () => {
     const c = new RaydiumAmmClient({ poolAddress: 'P', rpcUrl: 'mock://', jitoBlockEngine: 'mock://' }, rpc as never, solRef as never, submitter as never);
     const sig = await c.submitSwap({
       inputAsset: 'BERT', outputAsset: 'SOL', amountIn: new Decimal('1000'),
-      expectedAmountOut: new Decimal('0.0044'), slippageBps: 50, routeJson: '{}',
+      expectedAmountOut: new Decimal('0.0044'), slippageBps: 50, priceImpactBps: 10, routeJson: '{}',
     }, { jito: true, tipLamports: 10_000 });
     expect(sig).toBe('SIG-DEAD-BEEF');
   });

@@ -13,7 +13,8 @@ export interface SwapQuote {
   outputAsset: Asset;
   amountIn: Decimal;
   expectedAmountOut: Decimal;
-  slippageBps: number;
+  slippageBps: number;       // tolerance — kept for info
+  priceImpactBps: number;    // realized impact, from Jupiter priceImpactPct × 10000
   routeJson: string;
 }
 

@@ -37,12 +37,16 @@ export class HedgeExecutor {
     return fillSide === 'buy' ? { input: 'BERT', output: 'SOL' } : { input: 'SOL', output: 'BERT' };
   }
 
-  async onFill(fill: Fill): Promise<void> {
+  async onFill(fill: Fill, solUsd: Decimal): Promise<void> {
     const hedgeId = nextHedgeId();
     const tIntent = new Date().toISOString();
     const dir = this.hedgeDir(fill.side);
 
-    const amountIn = dir.input === 'BERT' ? fill.volume : fill.volume.mul(fill.price);
+    // Sell-side: Kraken filled a BERT sell, so we need to BUY BERT back on DEX.
+    // amountIn is SOL = (BERT volume * BERT price in USD) / (SOL price in USD).
+    const amountIn = dir.input === 'BERT'
+      ? fill.volume
+      : fill.volume.mul(fill.price).div(solUsd);
 
     await this.opts.store.writeHedge({
       hedgeId, triggeringFillId: fill.fillId, status: 'intent_queued',
@@ -57,13 +61,13 @@ export class HedgeExecutor {
       tIntent, tConfirmed: null,
     });
 
-    if (quote.slippageBps > this.opts.maxDexSlippageBps) {
+    if (quote.priceImpactBps > this.opts.maxDexSlippageBps) {
       await this.opts.store.writeHedge({
         hedgeId, triggeringFillId: fill.fillId, status: 'slippage_aborted',
-        jupiterQuote: quote.routeJson, txSig: null, slippageRealized: String(quote.slippageBps),
+        jupiterQuote: quote.routeJson, txSig: null, slippageRealized: String(quote.priceImpactBps),
         tIntent, tConfirmed: null,
       });
-      this.opts.notifier.page(`hedge ${hedgeId} aborted: slippage ${quote.slippageBps}bps > ${this.opts.maxDexSlippageBps}bps`);
+      this.opts.notifier.page(`hedge ${hedgeId} aborted: priceImpact ${quote.priceImpactBps}bps > ${this.opts.maxDexSlippageBps}bps`);
       return;
     }
 

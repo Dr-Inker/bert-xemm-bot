@@ -11,7 +11,7 @@ describe('runEmergencyUnwind', () => {
     };
     const dex = {
       walletBalances: vi.fn().mockResolvedValue({ bert: new Decimal('1000'), sol: new Decimal('0.1') }),
-      estimateSwap: vi.fn().mockResolvedValue({ inputAsset:'BERT', outputAsset:'SOL', amountIn: new Decimal('1000'), expectedAmountOut: new Decimal('0.005'), slippageBps: 50, routeJson: '{}' }),
+      estimateSwap: vi.fn().mockResolvedValue({ inputAsset:'BERT', outputAsset:'SOL', amountIn: new Decimal('1000'), expectedAmountOut: new Decimal('0.005'), slippageBps: 50, priceImpactBps: 10, routeJson: '{}' }),
       submitSwap: vi.fn().mockResolvedValue('SIG-EMERGENCY'),
     };
     const notifier = { page: vi.fn() };

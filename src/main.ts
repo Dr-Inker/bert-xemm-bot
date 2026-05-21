@@ -139,7 +139,7 @@ async function main(): Promise<void> {
     logger,
   });
 
-  const fillLoop = new FillLoop(cex, hedgeExec, logger);
+  const fillLoop = new FillLoop(cex, hedgeExec, logger, async () => (await dex.poolMidUsd()).solUsd);
   const wdLoop = new WatchdogLoop(watchdog, cfg.watchdog.cadenceMs, logger);
 
   // Observer mode must NEVER place orders. Override CEX placeLimit at runtime so the
