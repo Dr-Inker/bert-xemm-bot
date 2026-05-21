@@ -2,7 +2,7 @@
 
 CEX-DEX hedged market maker. Quotes BERT/USD post-only on Kraken (via the `kraken` binary subprocess); hedges fills on Raydium AMM v4 via Jupiter v6 with Jito bundles.
 
-**Status as of 2026-05-21: Phase 0 — wiring substantially complete.** Builds, lints, 68 unit tests pass, coverage gate passes (~89% lines). Real `SolanaRpcAdapter` + `JupiterSolRef` wired; watchdog evaluator runs 4 of 8 kill conditions; emergency-exit functional; venue wiring extracted to `src/orchestrator/wire.ts`. Remaining v1.1 work listed in "Known gaps" below — chiefly 4 deferred watchdog conditions, hedge-confirmation polling, in-flight tracking, Kraken book subscription.
+**Status as of 2026-05-21: Phase 0 — audit close-out complete.** Builds, lints, 89 unit tests pass, coverage gate passes (91.33% lines / 75% branches / 92.72% functions). All 13 critical+important audit gaps closed across 9 integration commits. Watchdog evaluates **all 8 kill conditions** (netDelta, dailyPnl via `PnlTracker`, raydium24h via `Raydium24hVol`, kraken24h, solUsd1h, rpcBurn via `RpcCounter`, adverseFill via `AdverseFillTracker`, staleData). Real `SolanaRpcAdapter` + `JupiterSolRef` + `BookCache` wired. HedgeExecutor does full state-machine: intent_queued → swap_quoted → tx_submitted → confirmed | failed_will_retry → failed_dead_letter (≤3 retries). Emergency-exit functional. Phase 1 observer expected to run end-to-end. Remaining items: MockDexVenue for true paper mode (v1.5), hot-wallet keyfile loading for Phase 3, condRpcBurn throttle tier.
 
 **Successor to** the retired bert-mm-bot at `/opt/bert-mm-bot` (Meteora DLMM MM, retired 2026-05-20 after the pool died).
 
