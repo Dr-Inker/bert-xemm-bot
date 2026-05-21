@@ -141,6 +141,15 @@ export class StateStore {
     return r.n;
   }
 
+  listOpenOrders(): Array<{ venueOrderId: string; clOrdId: string }> {
+    const rows = this.db.prepare(`
+      SELECT cl_ord_id AS clOrdId, kraken_txid AS venueOrderId
+      FROM orders
+      WHERE status = 'open'
+    `).all() as Array<{ clOrdId: string; venueOrderId: string }>;
+    return rows;
+  }
+
   withTransaction<T>(fn: () => T): T {
     const tx = this.db.transaction(fn);
     return tx();

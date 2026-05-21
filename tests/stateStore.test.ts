@@ -44,4 +44,26 @@ describe('StateStore', () => {
     })).toThrow('boom');
     expect(store.getOrderByClOrdId('cl-2')).toBeNull();
   });
+
+  it('listOpenOrders returns only orders with status=open', () => {
+    store.insertOrder({
+      clOrdId: 'cl-open-1', krakenTxid: 'O1', side: 'buy',
+      price: '0.0177', volume: '1000', status: 'open',
+      placedAt: '2026-05-20T00:00:00Z', lastUpdated: '2026-05-20T00:00:00Z',
+    });
+    store.insertOrder({
+      clOrdId: 'cl-cancelled-1', krakenTxid: 'O2', side: 'sell',
+      price: '0.0178', volume: '1000', status: 'cancelled',
+      placedAt: '2026-05-20T00:00:00Z', lastUpdated: '2026-05-20T00:00:00Z',
+    });
+    store.insertOrder({
+      clOrdId: 'cl-open-2', krakenTxid: 'O3', side: 'sell',
+      price: '0.0180', volume: '500', status: 'open',
+      placedAt: '2026-05-20T00:00:00Z', lastUpdated: '2026-05-20T00:00:00Z',
+    });
+    const open = store.listOpenOrders();
+    expect(open).toHaveLength(2);
+    expect(open.map(o => o.venueOrderId).sort()).toEqual(['O1', 'O3']);
+    expect(open.find(o => o.venueOrderId === 'O1')?.clOrdId).toBe('cl-open-1');
+  });
 });
