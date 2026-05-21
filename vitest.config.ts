@@ -19,6 +19,7 @@ export default defineConfig({
         'src/notifier.ts',
         'src/orchestrator/fillLoop.ts',
         'src/orchestrator/watchdogLoop.ts',
+        'src/orchestrator/wire.ts',
         'src/risk/killSwitchWatchdog.ts',
         'src/cli/status.ts',
         'src/cli/report.ts',

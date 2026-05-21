@@ -1,5 +1,6 @@
 import { Command } from 'commander';
 import { loadConfig } from '../config.js';
+import { logger } from '../logger.js';
 import { StateStore } from '../stateStore.js';
 import { runPause } from './pause.js';
 import { runResume } from './resume.js';
@@ -66,12 +67,20 @@ program.command('report')
   });
 
 program.command('emergency-exit')
-  .description('Cancel all and drain BERT to SOL; halts the bot')
+  .description('Cancel all and drain DEX BERT; halts the bot. Does NOT auto-withdraw USD.')
   .option('--config <path>', 'config path', '/etc/bert-xemm-bot/config.yaml')
-  .action(async (_opts: { config: string }) => {
-    // venue wiring deferred — same pattern as scripts/emergency-exit.ts; copy from main.ts when consolidated.
-    console.error('emergency-exit: wire venues from config (see Task 23 / src/main.ts) and call runEmergencyExitCli');
-    process.exit(2);
+  .action(async (opts: { config: string }) => {
+    const { wireVenues } = await import('../orchestrator/wire.js');
+    const { runEmergencyUnwind } = await import('../risk/emergencyUnwind.js');
+    const Decimal = (await import('decimal.js')).default;
+    const { cfg, cex, dex, store, notifier } = wireVenues(opts.config);
+    logger.warn({ mode: cfg.mode }, 'emergency-exit invoked from CLI');
+    await runEmergencyUnwind({
+      cex, dex,
+      notifier: { page: (m) => { void notifier.critical(m); } },
+      store: { setFlag: (k, v) => store.setFlag(k, v) },
+      minOrderBert: new Decimal('380'),
+    });
   });
 
 await program.parseAsync(process.argv);

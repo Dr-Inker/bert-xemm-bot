@@ -45,6 +45,14 @@ describe('StateStore', () => {
     expect(store.getOrderByClOrdId('cl-2')).toBeNull();
   });
 
+  it('insertKillEvent persists kill rows', () => {
+    store.insertKillEvent({ t: '2026-05-21T00:00:00Z', conditionId: 0, snapshotJson: '{"tripped":true}', actionTaken: 'cancel_all_reduce_only' });
+    const rows = (store as unknown as { db: import('better-sqlite3').Database }).db
+      .prepare('SELECT * FROM kill_events ORDER BY id DESC LIMIT 1').all() as Array<{ t: string; condition_id: number; snapshot_json: string; action_taken: string }>;
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.action_taken).toBe('cancel_all_reduce_only');
+  });
+
   it('listOpenOrders returns only orders with status=open', () => {
     store.insertOrder({
       clOrdId: 'cl-open-1', krakenTxid: 'O1', side: 'buy',

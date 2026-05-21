@@ -1,71 +1,70 @@
 import { writeFile } from 'node:fs/promises';
-import { loadConfig } from './config.js';
 import { logger } from './logger.js';
-import { StateStore } from './stateStore.js';
-import { Connection } from '@solana/web3.js';
-import { KrakenClient } from './venues/krakenClient.js';
-import { KrakenPaper } from './venues/krakenPaper.js';
-import { RaydiumAmmClient, type RpcAdapter, type SolRefAdapter } from './venues/raydiumAmmClient.js';
-import { JitoClient } from './jitoClient.js';
-import { TxSubmitter } from './txSubmitter.js';
 import { Reconciler } from './risk/reconciler.js';
 import { HedgeExecutor } from './strategy/hedgeExecutor.js';
 import { KillSwitchWatchdog } from './risk/killSwitchWatchdog.js';
 import { QuoterLoop } from './orchestrator/quoterLoop.js';
 import { FillLoop } from './orchestrator/fillLoop.js';
 import { WatchdogLoop } from './orchestrator/watchdogLoop.js';
-import { Notifier } from './notifier.js';
+import { wireVenues } from './orchestrator/wire.js';
 import Decimal from 'decimal.js';
 import { NetDeltaTracker } from './strategy/netDeltaTracker.js';
 import { trustedMid } from './priceOracle.js';
+import {
+  condNetDelta, condKraken24hMin, condSolUsd1hMove, condStaleData,
+  type KillResult,
+} from './risk/conditions.js';
+
+// Rolling 1h window of solUsd reads — feeds condSolUsd1hMove.
+class SolUsdHistory {
+  private readings: { t: number; price: number }[] = [];
+  record(price: Decimal): void {
+    const now = Date.now();
+    this.readings.push({ t: now, price: price.toNumber() });
+    const cutoff = now - 3_600_000;
+    while (this.readings.length && this.readings[0]!.t < cutoff) this.readings.shift();
+  }
+  pctMove1h(): number {
+    if (this.readings.length < 2) return 0;
+    const first = this.readings[0]!.price;
+    const last = this.readings[this.readings.length - 1]!.price;
+    if (first === 0) return 0;
+    return ((last - first) / first) * 100;
+  }
+}
+
+// Cached Kraken 24h USD volume (pair vwap * base volume). Feeds condKraken24hMin.
+class Kraken24hVol {
+  private cache: { value: Decimal; at: number } | null = null;
+  constructor(private pair: string, private ttlMs = 300_000) {}
+  async fetch(): Promise<Decimal> {
+    if (this.cache && Date.now() - this.cache.at < this.ttlMs) return this.cache.value;
+    try {
+      const r = await fetch(`https://api.kraken.com/0/public/Ticker?pair=${this.pair}`);
+      if (!r.ok) throw new Error(`kraken ticker ${r.status}`);
+      const j = await r.json() as { result?: Record<string, { v?: string[]; p?: string[] }> };
+      const key = Object.keys(j.result ?? {})[0];
+      const entry = key ? j.result?.[key] : undefined;
+      const volBert = entry?.v?.[1] ?? '0';
+      const vwap = entry?.p?.[1] ?? '0';
+      const volUsd = new Decimal(volBert).mul(new Decimal(vwap));
+      this.cache = { value: volUsd, at: Date.now() };
+      return volUsd;
+    } catch (err) {
+      logger.warn({ err }, 'kraken 24h volume fetch failed; treating as 0');
+      return new Decimal(0);
+    }
+  }
+}
 
 async function main(): Promise<void> {
-  const cfg = loadConfig(process.env['CONFIG_PATH'] ?? '/etc/bert-xemm-bot/config.yaml');
+  const { cfg, store, cex, dex, notifier } = wireVenues();
   logger.info({ mode: cfg.mode, enabled: cfg.enabled }, 'startup');
-
-  const store = new StateStore(cfg.paths.state);
-
-  const notifierOpts: ConstructorParameters<typeof Notifier>[0] = {
-    logger,
-  };
-  if (cfg.notifier.discordWebhookUrl) notifierOpts.discordWebhookUrl = cfg.notifier.discordWebhookUrl;
-  if (cfg.notifier.telegram) {
-    notifierOpts.telegram = {
-      botToken: process.env[cfg.notifier.telegram.botTokenEnv] ?? '',
-      chatId: cfg.notifier.telegram.chatId,
-    };
-  }
-  const notifier = new Notifier(notifierOpts);
-
-  const cex = cfg.mode === 'paper'
-    ? new KrakenPaper({ cliBinaryPath: cfg.kraken.cliBinaryPath, pair: cfg.kraken.pair })
-    : new KrakenClient({
-        cliBinaryPath: cfg.kraken.cliBinaryPath, pair: cfg.kraken.pair,
-        apiKeyEnv: cfg.kraken.apiKeyEnv, apiSecretEnv: cfg.kraken.apiSecretEnv, paper: false,
-      });
-
-  const connection = new Connection(cfg.raydium.rpcUrl, 'confirmed');
-  const jito = new JitoClient({ blockEngineUrl: cfg.raydium.jitoBlockEngine });
-  // signer: real implementations load the hot wallet keyfile. For Phase 1 observer / Phase 2 paper, a no-op signer is fine.
-  const signer = { sign: async <T>(tx: T): Promise<T> => tx };
-  const submitter = new TxSubmitter({ connection, jito, signer: signer as never });
-
-  // Minimal RPC adapter — Phase 1/2 stub. Real implementation will use @solana/web3.js calls.
-  const rpc: RpcAdapter = {
-    async getPoolState(_pool) { return { baseVault: 'BV', quoteVault: 'QV', baseDecimals: 6, quoteDecimals: 9 }; },
-    async getTokenBalance(_acct) { return { uiAmount: '0', amount: '0', decimals: 6 }; },
-    async getWalletBalances() { return { bert: '0', sol: '0' }; },
-  };
-  const solRef: SolRefAdapter = { async fetchSolUsd() { return '86.12'; } };
-  const dex = new RaydiumAmmClient(
-    { poolAddress: cfg.raydium.poolAddress, rpcUrl: cfg.raydium.rpcUrl, jitoBlockEngine: cfg.raydium.jitoBlockEngine },
-    rpc, solRef, submitter, '', cfg.jupiter.baseUrl, cfg.jupiter.maxSlippageBps,
-  );
 
   const reconciler = new Reconciler({
     cex,
     store: {
-      listOpenOrders: async () => [],
+      listOpenOrders: async () => store.listOpenOrders(),
       setFlag: (k, v) => store.setFlag(k, v),
     },
     notifier: { page: (m) => { void notifier.critical(m); } },
@@ -86,20 +85,57 @@ async function main(): Promise<void> {
     jitoTipLamports: 10_000,
   });
 
+  const tracker = new NetDeltaTracker();
+
+  const solUsdHist = new SolUsdHistory();
+  const kraken24h = new Kraken24hVol(cfg.kraken.pair);
+
+  const evaluateConditions = async (): Promise<KillResult[]> => {
+    const out: KillResult[] = [];
+    try {
+      const mid = await dex.poolMidUsd();
+      solUsdHist.record(mid.solUsd);
+      const balances = await cex.balances();
+      const dexBal = await dex.walletBalances();
+      const inv = tracker.snapshot({
+        kraken: balances, dex: dexBal,
+        inFlightHedgesBert: new Decimal('0'), midUsd: mid.mid,
+      });
+
+      out.push(condNetDelta({ usdNet: inv.usdNet }, { netDeltaUsd: cfg.watchdog.conditions.netDeltaUsd }));
+
+      const kVol = await kraken24h.fetch();
+      out.push(condKraken24hMin({ kraken24hVolUsd: kVol }, { kraken24hMinUsd: cfg.watchdog.conditions.kraken24hMinUsd }));
+
+      out.push(condSolUsd1hMove({ pctMove1h: solUsdHist.pctMove1h() }, { solUsd1hMaxAbsPct: cfg.watchdog.conditions.solUsd1hMaxAbsPct }));
+
+      const ageSec = (Date.now() - mid.asOf.getTime()) / 1000;
+      out.push(condStaleData({ oldestSourceAgeSec: ageSec }, { staleDataSeconds: cfg.watchdog.conditions.staleDataSeconds }));
+
+      // Deferred conditions (not evaluated in v1.1 — need infrastructure):
+      //   condDailyPnl: needs running PnL tracker (TODO).
+      //   condRaydium24hMin: needs DexScreener trailing volume aggregator (TODO).
+      //   condRpcBurn: needs RPC call counter (TODO).
+      //   condAdverseFill: needs post-fill price movement tracker (TODO).
+    } catch (err) {
+      logger.error({ err }, 'watchdog evaluate failed; returning empty (open)');
+    }
+    return out;
+  };
+
   const watchdog = new KillSwitchWatchdog({
     store: {
       setFlag: (k, v) => store.setFlag(k, v),
-      insertKillEvent: () => { /* persistence stub for v1; full schema in Task 25 read queries */ },
+      insertKillEvent: (r) => store.insertKillEvent(r),
     },
     cex,
     notifier: {
       page: (m) => { void notifier.critical(m); },
       warn: (m) => { void notifier.warn(m); },
     },
-    evaluate: async () => [],
+    evaluate: evaluateConditions,
   });
 
-  const tracker = new NetDeltaTracker();
   const quoter = new QuoterLoop({
     cex, store,
     readInputs: async () => {

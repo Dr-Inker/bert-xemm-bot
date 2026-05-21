@@ -150,6 +150,13 @@ export class StateStore {
     return rows;
   }
 
+  insertKillEvent(r: { t: string; conditionId: number; snapshotJson: string; actionTaken: string }): void {
+    this.db.prepare(`
+      INSERT INTO kill_events (t, condition_id, snapshot_json, action_taken)
+      VALUES (@t, @conditionId, @snapshotJson, @actionTaken)
+    `).run(r);
+  }
+
   withTransaction<T>(fn: () => T): T {
     const tx = this.db.transaction(fn);
     return tx();
