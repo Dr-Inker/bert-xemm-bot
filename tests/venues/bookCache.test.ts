@@ -49,6 +49,60 @@ describe('BookCache', () => {
     expect(s.asks).toHaveLength(0);
   });
 
+  it('keeps prior asks when a bid-only delta arrives', async () => {
+    const snaps = [
+      // Full snapshot with both sides
+      { bids: [{ price: '0.0176', volume: '1000' }], asks: [{ price: '0.0178', volume: '500' }], t: new Date('2026-05-21T00:00:00Z') },
+      // Bid-only delta — asks is empty
+      { bids: [{ price: '0.0177', volume: '1500' }], asks: [] as { price: string; volume: string }[], t: new Date('2026-05-21T00:00:01Z') },
+    ];
+    const cex = { watchBook: vi.fn().mockImplementation(() => fakeStream(snaps)) };
+    const logger = { warn: vi.fn(), error: vi.fn(), info: vi.fn() };
+    const cache = new BookCache('BERTUSD', logger as never);
+
+    vi.useFakeTimers();
+    const runP = cache.run(cex as never, 'BERTUSD', 10);
+    await vi.advanceTimersByTimeAsync(0);
+
+    const s = cache.snapshot();
+    expect(s.bids[0]?.price.toString()).toBe('0.0177');
+    // Asks should be preserved from the first snapshot
+    expect(s.asks).toHaveLength(1);
+    expect(s.asks[0]?.price.toString()).toBe('0.0178');
+
+    cache.shutdown();
+    await vi.advanceTimersByTimeAsync(5_000);
+    vi.useRealTimers();
+    await runP;
+  }, 10_000);
+
+  it('keeps prior bids when an ask-only delta arrives', async () => {
+    const snaps = [
+      // Full snapshot with both sides
+      { bids: [{ price: '0.0176', volume: '1000' }], asks: [{ price: '0.0178', volume: '500' }], t: new Date('2026-05-21T00:00:00Z') },
+      // Ask-only delta — bids is empty
+      { bids: [] as { price: string; volume: string }[], asks: [{ price: '0.0179', volume: '800' }], t: new Date('2026-05-21T00:00:01Z') },
+    ];
+    const cex = { watchBook: vi.fn().mockImplementation(() => fakeStream(snaps)) };
+    const logger = { warn: vi.fn(), error: vi.fn(), info: vi.fn() };
+    const cache = new BookCache('BERTUSD', logger as never);
+
+    vi.useFakeTimers();
+    const runP = cache.run(cex as never, 'BERTUSD', 10);
+    await vi.advanceTimersByTimeAsync(0);
+
+    const s = cache.snapshot();
+    // Bids should be preserved from the first snapshot
+    expect(s.bids).toHaveLength(1);
+    expect(s.bids[0]?.price.toString()).toBe('0.0176');
+    expect(s.asks[0]?.price.toString()).toBe('0.0179');
+
+    cache.shutdown();
+    await vi.advanceTimersByTimeAsync(5_000);
+    vi.useRealTimers();
+    await runP;
+  }, 10_000);
+
   it('reconnects after stream error and logs a warning', async () => {
     let calls = 0;
     const erroringStream = (async function* () {
