@@ -18,8 +18,8 @@ DELETE FROM kill_events;
 DELETE FROM hedges;
 DELETE FROM fills;
 DELETE FROM orders;
-INSERT INTO flags(k, v) VALUES('degraded', '0')
-  ON CONFLICT(k) DO UPDATE SET v='0';
+INSERT INTO flags(key, value) VALUES('degraded', '0')
+  ON CONFLICT(key) DO UPDATE SET value='0';
 SQL
 
 echo "Done. State after cleanup:"
@@ -27,4 +27,4 @@ sqlite3 "$DB" "SELECT 'kill_events', COUNT(*) FROM kill_events
                UNION ALL SELECT 'hedges', COUNT(*) FROM hedges
                UNION ALL SELECT 'fills', COUNT(*) FROM fills
                UNION ALL SELECT 'orders', COUNT(*) FROM orders
-               UNION ALL SELECT 'degraded_flag', COUNT(*) FROM flags WHERE k='degraded' AND v='0';"
+               UNION ALL SELECT 'degraded_flag', COUNT(*) FROM flags WHERE key='degraded' AND value='0';"
