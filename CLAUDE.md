@@ -2,7 +2,7 @@
 
 CEX-DEX hedged market maker. Quotes BERT/USD post-only on Kraken (via the `kraken` binary subprocess); hedges fills on Raydium AMM v4 via Jupiter v6 with Jito bundles.
 
-**Status as of 2026-05-23: paper mode ripped out (commit `f8ef771`); fast-track-to-live plan in progress.** Modes are now `{observer, live}`. 91 tests pass, build clean. Phase A bug-fix work (BookCache one-sided merge, QuoterLoop empty-book guard, AdverseFillTracker minResolved guard) still pending per `docs/superpowers/plans/2026-05-23-fast-track-live.md`. **The host's systemd service is still running the OLD broken paper build** — Task 7 (deploy + smoke check) will rebuild + flip to clean observer + start the 48h go/no-go window. See `docs/superpowers/specs/2026-05-23-fast-track-live-design.md` for the why (bot was degraded for 30+ hours due to phantom-fill poisoning from a broken `kraken paper` subprocess + a BookCache zeroing bug → only 0.6% of basis samples had both bid AND ask populated).
+**Status as of 2026-05-23: Paper mode removed. BookCache merge fix + QuoterLoop empty-book guard + AdverseFillTracker minResolved guard landed. Ready for clean 48h observer run per docs/superpowers/specs/2026-05-23-fast-track-live-design.md.**
 
 **Successor to** the retired bert-mm-bot at `/opt/bert-mm-bot` (Meteora DLMM MM, retired 2026-05-20 after the pool died).
 
@@ -123,7 +123,7 @@ Original audit found 6 critical + 7 important gaps. After three integration pass
 ## Readiness assessment
 
 - **Plumbing demo**: works today (91 tests pass, build clean).
-- **Observer**: **not yet honest** — BookCache one-sided merge bug means 99.4% of basis samples currently record `kraken_bid=0` or `kraken_ask=0`. Plan Task 2 fixes this. After the fix, `basis_samples` will record real Kraken book + real Raydium mid via DexScreener. Observer needs no API keys (uses `KrakenObserver` + public WS); only Solana Connection (free public RPC OK).
+- **Observer**: **ready** — BookCache merge fix landed; `basis_samples` now records real Kraken book + real Raydium mid via DexScreener. Observer needs no API keys (uses `KrakenObserver` + public WS); only Solana Connection (free public RPC OK).
 - **Live warm-up**: hot-wallet keyfile loading is wired (`wire.ts::buildSigner` when `mode === 'live'`). Operator must place keyfile at `paths.keyfile` mode `0640 root:bertxemm` (the bot's group needs read; `0600` denies it) and verify Kraken API key permissions (Withdraw OFF).
 
 ## Reference
