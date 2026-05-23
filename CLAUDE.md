@@ -2,7 +2,7 @@
 
 CEX-DEX hedged market maker. Quotes BERT/USD post-only on Kraken (via the `kraken` binary subprocess); hedges fills on Raydium AMM v4 via Jupiter v6 with Jito bundles.
 
-**Status as of 2026-05-21: Phase 0 — audit close-out complete.** Builds, lints, 89 unit tests pass, coverage gate passes (91.33% lines / 75% branches / 92.72% functions). All 13 critical+important audit gaps closed across 9 integration commits. Watchdog evaluates **all 8 kill conditions** (netDelta, dailyPnl via `PnlTracker`, raydium24h via `Raydium24hVol`, kraken24h, solUsd1h, rpcBurn via `RpcCounter`, adverseFill via `AdverseFillTracker`, staleData). Real `SolanaRpcAdapter` + `JupiterSolRef` + `BookCache` wired. HedgeExecutor does full state-machine: intent_queued → swap_quoted → tx_submitted → confirmed | failed_will_retry → failed_dead_letter (≤3 retries). Emergency-exit functional. Phase 1 observer expected to run end-to-end. Remaining items: MockDexVenue for true paper mode (v1.5), hot-wallet keyfile loading for Phase 3, condRpcBurn throttle tier.
+**Status as of 2026-05-22: Phase 1 ready — observer deployable; Phase 2 paper unblocked.** Builds, lints, 94 unit tests pass, coverage gate passes. All 13 critical+important audit gaps closed. v1.5 MockDexVenue wired for paper mode (`submitSwap` → `PAPER-*`, instant confirm). Hot-wallet keyfile loading wired for live mode (`wire.ts` reads `paths.keyfile` when `mode: live`). Remaining: condRpcBurn throttle tier (v1.2, deferred), Phase 1 observer deployment on host (no `/etc/bert-xemm-bot/config.yaml` yet).
 
 **Successor to** the retired bert-mm-bot at `/opt/bert-mm-bot` (Meteora DLMM MM, retired 2026-05-20 after the pool died).
 
@@ -28,6 +28,7 @@ src/
 │   ├── krakenErrors.ts           # Map Kraken CLI error envelope → VenueError
 │   ├── dexVenue.ts               # DexVenue interface + Asset/PoolMid/SwapQuote types
 │   ├── raydiumAmmClient.ts       # On-chain reserve reads + Jupiter swap submission
+│   ├── mockDexVenue.ts           # Paper mode: real quotes, mock submitSwap (PAPER-* sigs)
 │   └── jupiterApi.ts             # Jupiter v6 /quote + /swap HTTP client (mints + decimals)
 ├── strategy/
 │   ├── xemmQuoter.ts             # decideQuotes(input) → QuoteIntent[]. Pure decision function.
@@ -82,7 +83,7 @@ pnpm cli status   # default config: /etc/bert-xemm-bot/config.yaml
 ## Phase progression
 
 1. **Observer (2 weeks)** — `mode: observer`. No orders. Logs basis distribution. **Phase 1 go/no-go gate**: `pnpm cli basis-snapshot --since <14 days ago>` + awk command in `docs/DEPLOY.md`. Need ≥5 crossings/day above ~140 bps for the strategy to be worth deploying.
-2. **Paper (2 weeks)** — `mode: paper`. CEX side uses `KrakenPaper` (`kraken --paper` subprocess). DEX side currently uses the same real Jupiter client — needs a MockDexVenue for true paper mode (Phase 1.5 work).
+2. **Paper (2 weeks)** — `mode: paper`. CEX side uses `KrakenPaper` (`kraken --paper` subprocess). DEX side uses `MockDexVenue` (real Jupiter quotes, mock `submitSwap`).
 3. **Warm-up ($100, 1 week)** — `mode: live`. Manual operator gate per session.
 4. **Staged ramp** — $500 → $2K → $5K (hard ceiling for Kraken venue).
 
@@ -112,14 +113,14 @@ Original audit found 6 critical + 7 important gaps. After three integration pass
 15. `condDailyPnl` signs are slippery — `pnlPct < dailyPnlPct` where `dailyPnlPct=-2` means "trip when pnl < -2". OK as is.
 16. `NetDeltaTracker.snapshot` subtracts `inFlightHedgesBert` unconditionally — needs signed direction (currently uses absolute `bert_notional`). Conservative for inventory cap; tighten when sell-side hedging gets first real flow.
 17. `feeTier` parser uses `cfg.kraken.pair` as key into `j.fees`; real Kraken `TradeVolume` may use a different code. Falls back to 0.16/0.26 silently.
-18. Hot-wallet keyfile loading not wired into `wireVenues` — required for Phase 3 warm-up (live submission). For Phase 1 observer and Phase 2 paper, the no-op signer is fine.
+18. ~~Hot-wallet keyfile loading not wired into `wireVenues`~~ — **Closed (2026-05-22).** `wire.ts::buildSigner` loads keyfile when `mode === 'live'`; pubkey passed to `SolanaRpcAdapter` + `RaydiumAmmClient`.
 
 ## Readiness assessment
 
 - **Phase 0 plumbing demo**: works today (87+ tests pass, build clean, coverage 91%).
 - **Phase 1 observer**: should work end-to-end. `basis_samples` will record real Kraken book + real Raydium mid via DexScreener. The 14-day go/no-go awk gate is honest. Acceptable to run on a paid Solana RPC tier (DexScreener calls are free; Jupiter `/price` calls are free; `SolanaRpcAdapter` only hits Connection for wallet reads which require a configured `hotWalletPubkey` — for observer mode no wallet is needed).
-- **Phase 2 paper**: needs the v1.5 MockDexVenue work (DEX side currently uses real Jupiter quotes — fine for testing logic, but `submitSwap` would actually submit if a hot wallet were configured). Block on operator wiring the no-op DEX submitter for paper mode.
-- **Phase 3 warm-up ($100 live)**: needs hot-wallet keyfile loading wired into `wireVenues` (gap #18) + verification of real Kraken API key permissions (Withdraw OFF per invariants).
+- **Phase 2 paper**: ready. `MockDexVenue` short-circuits DEX submission; `main.ts` treats `PAPER-*` sigs as instantly confirmed. Requires `kraken` binary + `kraken paper init`.
+- **Phase 3 warm-up ($100 live)**: hot-wallet keyfile loading is wired. Operator must place keyfile at `paths.keyfile` (mode 0600) and verify Kraken API key permissions (Withdraw OFF).
 
 ## Reference
 

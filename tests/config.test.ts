@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const VALID_YAML = `
-mode: paper
+mode: observer
 enabled: true
 kraken:
   pair: BERTUSD
@@ -59,7 +59,7 @@ function validConfig(): BotConfig {
 describe('config', () => {
   it('parses a minimal valid config', () => {
     const cfg = validConfig();
-    expect(cfg.mode).toBe('paper');
+    expect(cfg.mode).toBe('observer');
     expect(cfg.quoter.cadenceMs).toBe(2500);
     expect(cfg.watchdog.conditions.netDeltaUsd).toBe(500);
   });

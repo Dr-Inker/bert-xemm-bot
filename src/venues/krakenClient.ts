@@ -2,6 +2,7 @@ import Decimal from 'decimal.js';
 import { execFileNoThrow } from '../utils/execFileNoThrow.js';
 import { mapKrakenError } from './krakenErrors.js';
 import { spawnKrakenStream, ndjsonLines } from './krakenStream.js';
+import { toWsPair } from './krakenPair.js';
 import { VenueError, type HedgeVenue, type PlaceLimitParams, type AmendParams } from './hedgeVenue.js';
 import type { Fill, OrderUpdate, BookSnapshot, Order, FeeTier } from '../types.js';
 
@@ -112,18 +113,19 @@ export class KrakenClient implements HedgeVenue {
   }
 
   async *watchBook(pair: string, depth: number): AsyncIterable<BookSnapshot> {
-    const child = spawnKrakenStream(this.cfg.cliBinaryPath, [...this.base(), 'ws', 'book', pair, '--depth', String(depth)]);
+    const wsPair = toWsPair(pair);
+    const child = spawnKrakenStream(this.cfg.cliBinaryPath, [...this.base(), 'ws', 'book', wsPair, '--depth', String(depth)]);
     try {
       for await (const event of ndjsonLines(child)) {
-        const ev = event as { channel?: string; data?: { symbol?: string; bids?: { price: string; qty: string }[]; asks?: { price: string; qty: string }[]; timestamp?: string } };
+        const ev = event as { channel?: string; data?: { symbol?: string; bids?: { price: string; qty: string }[] | { price: number; qty: number }[]; asks?: { price: string; qty: string }[] | { price: number; qty: number }[]; timestamp?: string }[] | { symbol?: string; bids?: { price: string; qty: string }[]; asks?: { price: string; qty: string }[]; timestamp?: string } };
         if (ev?.channel !== 'book' || !ev.data) continue;
-        const d = ev.data;
-        if (!d.bids || !d.asks || !d.symbol || !d.timestamp) continue;
+        const raw = Array.isArray(ev.data) ? ev.data[0] : ev.data;
+        if (!raw?.bids || !raw?.asks || !raw.symbol || !raw.timestamp) continue;
         yield {
-          pair: d.symbol,
-          bids: d.bids.map(l => ({ price: new Decimal(l.price), volume: new Decimal(l.qty) })),
-          asks: d.asks.map(l => ({ price: new Decimal(l.price), volume: new Decimal(l.qty) })),
-          t: new Date(d.timestamp),
+          pair: raw.symbol,
+          bids: raw.bids.map(l => ({ price: new Decimal(String(l.price)), volume: new Decimal(String(l.qty)) })),
+          asks: raw.asks.map(l => ({ price: new Decimal(String(l.price)), volume: new Decimal(String(l.qty)) })),
+          t: new Date(raw.timestamp),
         };
       }
     } finally { child.kill(); }

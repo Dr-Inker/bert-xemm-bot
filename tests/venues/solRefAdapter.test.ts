@@ -18,9 +18,14 @@ describe('JupiterSolRef', () => {
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 
-  it('throws on non-ok response', async () => {
-    (fetch as ReturnType<typeof vi.fn>).mockResolvedValue({ ok: false, status: 503 });
+  it('falls back to Kraken SOLUSD ticker when Jupiter is unreachable', async () => {
+    (fetch as ReturnType<typeof vi.fn>)
+      .mockRejectedValueOnce(new Error('ENOTFOUND'))
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ result: { SOLUSD: { c: ['86.99'] } } }),
+      });
     const r = new JupiterSolRef({ cacheMs: 0 });
-    await expect(r.fetchSolUsd()).rejects.toThrow(/503/);
+    await expect(r.fetchSolUsd()).resolves.toBe('86.99');
   });
 });

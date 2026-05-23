@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { parse as parseYaml } from 'yaml';
 
 export const BotConfigSchema = z.object({
-  mode: z.enum(['observer', 'paper', 'live']),
+  mode: z.enum(['observer', 'live']),
   enabled: z.boolean(),
 
   kraken: z.object({

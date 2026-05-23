@@ -1,16 +1,17 @@
-import { Connection } from '@solana/web3.js';
+import { Connection, VersionedTransaction } from '@solana/web3.js';
 import { loadConfig, type BotConfig } from '../config.js';
 import { logger } from '../logger.js';
 import { StateStore } from '../stateStore.js';
 import { KrakenClient } from '../venues/krakenClient.js';
-import { KrakenPaper } from '../venues/krakenPaper.js';
+import { KrakenObserver } from '../venues/krakenObserver.js';
 import { RaydiumAmmClient } from '../venues/raydiumAmmClient.js';
 import { SolanaRpcAdapter } from '../venues/solanaRpcAdapter.js';
 import { JupiterSolRef } from '../venues/solRefAdapter.js';
 import { JitoClient } from '../jitoClient.js';
-import { TxSubmitter } from '../txSubmitter.js';
+import { TxSubmitter, type TxSubmitterDeps } from '../txSubmitter.js';
 import { Notifier } from '../notifier.js';
 import { RpcCounter } from '../utils/rpcCounter.js';
+import { loadHotWallet } from '../utils/hotWallet.js';
 import type { HedgeVenue } from '../venues/hedgeVenue.js';
 import type { DexVenue } from '../venues/dexVenue.js';
 
@@ -24,6 +25,27 @@ export interface WiredVenues {
   notifier: Notifier;
   connection: Connection;
   rpcCounter: RpcCounter;
+}
+
+function buildSigner(cfg: BotConfig): { signer: TxSubmitterDeps['signer']; hotWalletPubkey: string } {
+  if (cfg.mode !== 'live') {
+    return {
+      hotWalletPubkey: '',
+      signer: { sign: async <T>(tx: T): Promise<T> => tx },
+    };
+  }
+
+  const kp = loadHotWallet(cfg.paths.keyfile);
+  logger.info({ pubkey: kp.publicKey.toBase58() }, 'loaded hot wallet for live mode');
+  return {
+    hotWalletPubkey: kp.publicKey.toBase58(),
+    signer: {
+      sign: async (tx: VersionedTransaction): Promise<VersionedTransaction> => {
+        tx.sign([kp]);
+        return tx;
+      },
+    },
+  };
 }
 
 export function wireVenues(configPath?: string): WiredVenues {
@@ -40,8 +62,8 @@ export function wireVenues(configPath?: string): WiredVenues {
   }
   const notifier = new Notifier(notifierOpts);
 
-  const cex: HedgeVenue = cfg.mode === 'paper'
-    ? new KrakenPaper({ cliBinaryPath: cfg.kraken.cliBinaryPath, pair: cfg.kraken.pair })
+  const cex: HedgeVenue = cfg.mode === 'observer'
+    ? new KrakenObserver({ cliBinaryPath: cfg.kraken.cliBinaryPath, pair: cfg.kraken.pair })
     : new KrakenClient({
         cliBinaryPath: cfg.kraken.cliBinaryPath, pair: cfg.kraken.pair,
         apiKeyEnv: cfg.kraken.apiKeyEnv, apiSecretEnv: cfg.kraken.apiSecretEnv, paper: false,
@@ -49,20 +71,21 @@ export function wireVenues(configPath?: string): WiredVenues {
 
   const connection = new Connection(cfg.raydium.rpcUrl, 'confirmed');
   const jito = new JitoClient({ blockEngineUrl: cfg.raydium.jitoBlockEngine });
-  // signer: real implementations load the hot wallet keyfile. For Phase 1 observer / Phase 2 paper, a no-op signer is fine.
-  const signer = { sign: async <T>(tx: T): Promise<T> => tx };
-  const submitter = new TxSubmitter({ connection, jito, signer: signer as never });
+  const { signer, hotWalletPubkey } = buildSigner(cfg);
+  const submitter = new TxSubmitter({ connection, jito, signer });
 
   const rpcCounter = new RpcCounter();
-  const rpc = new SolanaRpcAdapter({
+  const rpcOpts: ConstructorParameters<typeof SolanaRpcAdapter>[0] = {
     connection, poolAddress: cfg.raydium.poolAddress, bertMint: BERT_MINT, rpcCounter,
-    // hotWalletPubkey: undefined for now — Phase 3 reads the keyfile. Wallet zeros are OK for observer/paper.
-  });
+  };
+  if (hotWalletPubkey) rpcOpts.hotWalletPubkey = hotWalletPubkey;
+  const rpc = new SolanaRpcAdapter(rpcOpts);
   const solRef = new JupiterSolRef();
-  const dex: DexVenue = new RaydiumAmmClient(
+  const raydium = new RaydiumAmmClient(
     { poolAddress: cfg.raydium.poolAddress, rpcUrl: cfg.raydium.rpcUrl, jitoBlockEngine: cfg.raydium.jitoBlockEngine },
-    rpc, solRef, submitter, '', cfg.jupiter.baseUrl, cfg.jupiter.maxSlippageBps,
+    rpc, solRef, submitter, hotWalletPubkey, cfg.jupiter.baseUrl, cfg.jupiter.maxSlippageBps,
   );
+  const dex: DexVenue = raydium;
 
   return { cfg, store, cex, dex, notifier, connection, rpcCounter };
 }
