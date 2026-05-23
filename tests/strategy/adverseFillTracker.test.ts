@@ -21,7 +21,7 @@ describe('AdverseFillTracker', () => {
   it('BUY adverse: post-mid < fill_price counts as adverse', async () => {
     const mids = [new Decimal('0.0170'), new Decimal('0.0170')];   // both post mids below buy price
     let i = 0;
-    const t = new AdverseFillTracker({ postFillDelayMs: 100, getMidUsd: async () => mids[i++]! });
+    const t = new AdverseFillTracker({ postFillDelayMs: 100, minResolved: 1, getMidUsd: async () => mids[i++]! });
     t.recordFill(fill('buy', '0.0177'));
     t.recordFill(fill('buy', '0.0178'));
     await vi.advanceTimersByTimeAsync(150);
@@ -32,11 +32,35 @@ describe('AdverseFillTracker', () => {
   it('SELL adverse: post-mid > fill_price counts as adverse', async () => {
     const mids = [new Decimal('0.0200'), new Decimal('0.0150')];   // first adverse, second favorable
     let i = 0;
-    const t = new AdverseFillTracker({ postFillDelayMs: 100, getMidUsd: async () => mids[i++]! });
+    const t = new AdverseFillTracker({ postFillDelayMs: 100, minResolved: 1, getMidUsd: async () => mids[i++]! });
     t.recordFill(fill('sell', '0.0177'));
     t.recordFill(fill('sell', '0.0177'));
     await vi.advanceTimersByTimeAsync(150);
     expect(t.adverseShareLast20()).toBe(0.5);
+    t.shutdown();
+  });
+
+  it('returns 0 when fewer than minResolved fills have resolved (default 5)', async () => {
+    const mids = [new Decimal('0.0170'), new Decimal('0.0170'), new Decimal('0.0170')];
+    let i = 0;
+    const t = new AdverseFillTracker({ postFillDelayMs: 100, getMidUsd: async () => mids[i++]! });
+    t.recordFill(fill('buy', '0.0177'));
+    t.recordFill(fill('buy', '0.0178'));
+    t.recordFill(fill('buy', '0.0179'));
+    await vi.advanceTimersByTimeAsync(150);
+    // Only 3 resolved — below default minResolved=5, so guard returns 0
+    expect(t.adverseShareLast20()).toBe(0);
+    t.shutdown();
+  });
+
+  it('returns 1.0 when minResolved adverse fills have resolved', async () => {
+    const mids = Array.from({ length: 5 }, () => new Decimal('0.0170'));
+    let i = 0;
+    const t = new AdverseFillTracker({ postFillDelayMs: 100, getMidUsd: async () => mids[i++]! });
+    for (let j = 0; j < 5; j++) t.recordFill(fill('buy', '0.0177'));
+    await vi.advanceTimersByTimeAsync(150);
+    // 5 resolved adverse fills — meets minResolved=5, so share = 1.0
+    expect(t.adverseShareLast20()).toBe(1);
     t.shutdown();
   });
 

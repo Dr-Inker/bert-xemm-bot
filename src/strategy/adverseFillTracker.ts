@@ -11,6 +11,7 @@ interface RecordedFill {
 export interface AdverseFillTrackerOpts {
   windowSize?: number;          // default 20
   postFillDelayMs?: number;     // default 5 * 60_000
+  minResolved?: number;         // default 5 — ignore adverse share until this many post-mids resolve
   getMidUsd: () => Promise<Decimal>;
 }
 
@@ -39,7 +40,7 @@ export class AdverseFillTracker {
   /** Share of last-N fills with a resolved postMid that moved adversely. Returns 0 if no resolved fills. */
   adverseShareLast20(): number {
     const resolved = this.fills.filter(f => f.postMidUsd !== null);
-    if (resolved.length === 0) return 0;
+    if (resolved.length < (this.opts.minResolved ?? 5)) return 0;
     let adverse = 0;
     for (const f of resolved) {
       // BUY adverse: price went DOWN after we bought (we paid too much).
