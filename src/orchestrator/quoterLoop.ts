@@ -23,13 +23,17 @@ export class QuoterLoop {
     const input = await this.o.readInputs();
     const intents = decideQuotes(input);
     const now = new Date().toISOString();
-    const topBid = input.krakenBook.bids[0]?.price?.toString() ?? '0';
-    const topAsk = input.krakenBook.asks[0]?.price?.toString() ?? '0';
-    this.o.store.insertBasisSample({
-      t: now, raydiumMidUsd: input.ref.raydiumMidUsd.toString(),
-      krakenBid: topBid, krakenAsk: topAsk, solUsd: input.ref.solUsd.toString(),
-      wouldHaveActed: intents.some(i => i.action === 'place'),
-    });
+    const topBid = input.krakenBook.bids[0]?.price;
+    const topAsk = input.krakenBook.asks[0]?.price;
+    if (topBid !== undefined && topAsk !== undefined) {
+      this.o.store.insertBasisSample({
+        t: now, raydiumMidUsd: input.ref.raydiumMidUsd.toString(),
+        krakenBid: topBid.toString(), krakenAsk: topAsk.toString(), solUsd: input.ref.solUsd.toString(),
+        wouldHaveActed: intents.some(i => i.action === 'place'),
+      });
+    } else {
+      this.o.logger.warn('quoter: book incomplete, skipping basis sample');
+    }
     for (const intent of intents) await this.dispatch(intent, now);
   }
   private async dispatch(intent: QuoteIntent, now: string): Promise<void> {
