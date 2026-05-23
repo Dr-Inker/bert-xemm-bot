@@ -2,7 +2,7 @@
 
 CEX-DEX hedged market maker. Quotes BERT/USD post-only on Kraken (via the `kraken` binary subprocess); hedges fills on Raydium AMM v4 via Jupiter v6 with Jito bundles.
 
-**Status as of 2026-05-22: Phase 1 ready — observer deployable; Phase 2 paper unblocked.** Builds, lints, 94 unit tests pass, coverage gate passes. All 13 critical+important audit gaps closed. v1.5 MockDexVenue wired for paper mode (`submitSwap` → `PAPER-*`, instant confirm). Hot-wallet keyfile loading wired for live mode (`wire.ts` reads `paths.keyfile` when `mode: live`). Remaining: condRpcBurn throttle tier (v1.2, deferred), Phase 1 observer deployment on host (no `/etc/bert-xemm-bot/config.yaml` yet).
+**Status as of 2026-05-23: paper mode ripped out (commit `f8ef771`); fast-track-to-live plan in progress.** Modes are now `{observer, live}`. 91 tests pass, build clean. Phase A bug-fix work (BookCache one-sided merge, QuoterLoop empty-book guard, AdverseFillTracker minResolved guard) still pending per `docs/superpowers/plans/2026-05-23-fast-track-live.md`. **The host's systemd service is still running the OLD broken paper build** — Task 7 (deploy + smoke check) will rebuild + flip to clean observer + start the 48h go/no-go window. See `docs/superpowers/specs/2026-05-23-fast-track-live-design.md` for the why (bot was degraded for 30+ hours due to phantom-fill poisoning from a broken `kraken paper` subprocess + a BookCache zeroing bug → only 0.6% of basis samples had both bid AND ask populated).
 
 **Successor to** the retired bert-mm-bot at `/opt/bert-mm-bot` (Meteora DLMM MM, retired 2026-05-20 after the pool died).
 
@@ -20,15 +20,17 @@ src/
 ├── jitoClient.ts                 # Jito Block Engine bundle submit
 ├── txSubmitter.ts                # submitProtected(): Jito-first with public-RPC fallback
 ├── utils/execFileNoThrow.ts      # SAFE subprocess wrapper. ALL Kraken calls route here.
+├── utils/hotWallet.ts            # loadHotWallet(path) → Solana Keypair from JSON keyfile
 ├── venues/
 │   ├── hedgeVenue.ts             # HedgeVenue interface + VenueError class
 │   ├── krakenClient.ts           # Kraken CLI subprocess wrapper (mutations, amend, streams, queries)
-│   ├── krakenPaper.ts            # Same surface, --paper flag, flat 0/26bps fee tier
+│   ├── krakenObserver.ts         # Observer-mode CEX: public WS book only, no API keys, mutations are no-ops
+│   ├── krakenPair.ts             # toWsPair(): config pair → Kraken WS-style pair (BERTUSD → BERT/USD)
 │   ├── krakenStream.ts           # spawn + readline NDJSON for ws streams
 │   ├── krakenErrors.ts           # Map Kraken CLI error envelope → VenueError
+│   ├── bookCache.ts              # In-memory top-of-book; subscribes to cex.watchBook(pair, depth)
 │   ├── dexVenue.ts               # DexVenue interface + Asset/PoolMid/SwapQuote types
 │   ├── raydiumAmmClient.ts       # On-chain reserve reads + Jupiter swap submission
-│   ├── mockDexVenue.ts           # Paper mode: real quotes, mock submitSwap (PAPER-* sigs)
 │   └── jupiterApi.ts             # Jupiter v6 /quote + /swap HTTP client (mints + decimals)
 ├── strategy/
 │   ├── xemmQuoter.ts             # decideQuotes(input) → QuoteIntent[]. Pure decision function.
@@ -59,14 +61,16 @@ ops/install.sh                    # Idempotent installer (creates user, dirs, pe
 
 docs/
 ├── DEPLOY.md                     # Phase progression + Phase 1 go/no-go awk gate
-└── (spec + plan still live in /opt/bert-mm-bot/docs/superpowers/ until repo migrates)
+└── superpowers/
+    ├── specs/2026-05-23-fast-track-live-design.md   # current operating plan (see headline status)
+    └── plans/2026-05-23-fast-track-live.md          # 8-task TDD implementation plan
 ```
 
 ## Quick start
 
 ```bash
 pnpm install
-pnpm test         # 89 passing (1 integration smoke skipped if `kraken` not on PATH)
+pnpm test         # 91 passing
 pnpm build
 pnpm cli status   # default config: /etc/bert-xemm-bot/config.yaml
 ```
@@ -82,10 +86,11 @@ pnpm cli status   # default config: /etc/bert-xemm-bot/config.yaml
 
 ## Phase progression
 
-1. **Observer (2 weeks)** — `mode: observer`. No orders. Logs basis distribution. **Phase 1 go/no-go gate**: `pnpm cli basis-snapshot --since <14 days ago>` + awk command in `docs/DEPLOY.md`. Need ≥5 crossings/day above ~140 bps for the strategy to be worth deploying.
-2. **Paper (2 weeks)** — `mode: paper`. CEX side uses `KrakenPaper` (`kraken --paper` subprocess). DEX side uses `MockDexVenue` (real Jupiter quotes, mock `submitSwap`).
-3. **Warm-up ($100, 1 week)** — `mode: live`. Manual operator gate per session.
-4. **Staged ramp** — $500 → $2K → $5K (hard ceiling for Kraken venue).
+Per the fast-track design (2026-05-23), paper mode is removed; the strategy is validated by observer data then by small live capital.
+
+1. **Observer (48h)** — `mode: observer`. No orders. Logs basis distribution. **Go/no-go gate is distribution-driven**, not a single threshold — see `docs/superpowers/specs/2026-05-23-fast-track-live-design.md` Phase C decision matrix. The legacy 14-day @ ≥5/day above 140bps is one row of that matrix.
+2. **Warm-up (live, size from observer histogram)** — `mode: live`. Manual operator gate per session. Hard ceiling for first session: $500.
+3. **Staged ramp** — $500 → $1K → $2K → $5K (hard ceiling for Kraken venue), days apart, gated on positive net PnL.
 
 ## Known gaps (audit 2026-05-20, integration passes 2026-05-21)
 
@@ -109,7 +114,7 @@ Original audit found 6 critical + 7 important gaps. After three integration pass
 13. ~~Coverage gate fails~~ — **Closed.** Pure-logic modules at >95%, total 91.33% lines / 73% branches / 91% functions / 91% statements. Gate (85/70/85/85) passes.
 
 **Minor (mostly cosmetic, may revisit pre-live):**
-14. `tests/integration/krakenPaperE2E.test.ts` is skipped (no `kraken` binary on this host).
+14. ~~`tests/integration/krakenPaperE2E.test.ts` is skipped~~ — **Closed (2026-05-23, commit `f8ef771`).** File deleted along with paper mode.
 15. `condDailyPnl` signs are slippery — `pnlPct < dailyPnlPct` where `dailyPnlPct=-2` means "trip when pnl < -2". OK as is.
 16. `NetDeltaTracker.snapshot` subtracts `inFlightHedgesBert` unconditionally — needs signed direction (currently uses absolute `bert_notional`). Conservative for inventory cap; tighten when sell-side hedging gets first real flow.
 17. `feeTier` parser uses `cfg.kraken.pair` as key into `j.fees`; real Kraken `TradeVolume` may use a different code. Falls back to 0.16/0.26 silently.
@@ -117,15 +122,16 @@ Original audit found 6 critical + 7 important gaps. After three integration pass
 
 ## Readiness assessment
 
-- **Phase 0 plumbing demo**: works today (87+ tests pass, build clean, coverage 91%).
-- **Phase 1 observer**: should work end-to-end. `basis_samples` will record real Kraken book + real Raydium mid via DexScreener. The 14-day go/no-go awk gate is honest. Acceptable to run on a paid Solana RPC tier (DexScreener calls are free; Jupiter `/price` calls are free; `SolanaRpcAdapter` only hits Connection for wallet reads which require a configured `hotWalletPubkey` — for observer mode no wallet is needed).
-- **Phase 2 paper**: ready. `MockDexVenue` short-circuits DEX submission; `main.ts` treats `PAPER-*` sigs as instantly confirmed. Requires `kraken` binary + `kraken paper init`.
-- **Phase 3 warm-up ($100 live)**: hot-wallet keyfile loading is wired. Operator must place keyfile at `paths.keyfile` (mode 0600) and verify Kraken API key permissions (Withdraw OFF).
+- **Plumbing demo**: works today (91 tests pass, build clean).
+- **Observer**: **not yet honest** — BookCache one-sided merge bug means 99.4% of basis samples currently record `kraken_bid=0` or `kraken_ask=0`. Plan Task 2 fixes this. After the fix, `basis_samples` will record real Kraken book + real Raydium mid via DexScreener. Observer needs no API keys (uses `KrakenObserver` + public WS); only Solana Connection (free public RPC OK).
+- **Live warm-up**: hot-wallet keyfile loading is wired (`wire.ts::buildSigner` when `mode === 'live'`). Operator must place keyfile at `paths.keyfile` mode `0640 root:bertxemm` (the bot's group needs read; `0600` denies it) and verify Kraken API key permissions (Withdraw OFF).
 
 ## Reference
 
-- **Design spec**: `/opt/bert-mm-bot/docs/superpowers/specs/2026-05-20-bert-xemm-bot-design.md` (still in predecessor repo; migrate to `docs/` here when the spec moves)
-- **Implementation plan**: `/opt/bert-mm-bot/docs/superpowers/plans/2026-05-20-bert-xemm-bot.md`
+- **Current operating spec**: `docs/superpowers/specs/2026-05-23-fast-track-live-design.md` — the fast-track-to-live plan that supersedes the 2026-05-20 "Phase 1.5 ready" framing.
+- **Current implementation plan**: `docs/superpowers/plans/2026-05-23-fast-track-live.md` — 8 TDD tasks.
+- **Original v1 design spec**: `/opt/bert-mm-bot/docs/superpowers/specs/2026-05-20-bert-xemm-bot-design.md` (still in predecessor repo).
+- **Original v1 implementation plan**: `/opt/bert-mm-bot/docs/superpowers/plans/2026-05-20-bert-xemm-bot.md`.
 - **Predecessor scaffolding (read-only reference)**: `/opt/bert-mm-bot/src/` — for porting questions about notifier/stateStore/jitoClient patterns.
 - **Live BERT venues** (verified 2026-05-20):
   - Raydium AMM v4 (BERT/SOL): `BmsZE6TkZYskyS1PatPKRyyazGdxWFxdia4BuvLg9AgY` — $1.04M TVL, $168K/24h
@@ -138,4 +144,5 @@ Original audit found 6 critical + 7 important gaps. After three integration pass
 - Don't add shell-interpolating subprocess calls. Route everything through `execFileNoThrow`.
 - Don't enable Kraken Withdraw permission on the bot's API key. Operator runs withdrawals manually or via a separate whitelist-bound key.
 - Don't revert the profitability gate fix in `8c6c5c3` — the gate must subtract round-trip costs from buffer, not compare buffer raw against minEdgeBps.
-- Don't deploy beyond Phase 0 until the remaining v1.1 work above is closed (4 deferred watchdog conditions, confirmation polling, in-flight tracking, Kraken book wiring).
+- Don't go live until the Phase A bug-fixes land AND the 48h observer go/no-go gate passes per the fast-track design.
+- Don't re-add paper mode. The decision was data-driven (operator's "paper trading only does so much good") plus the paper subprocess was the source of the phantom-fill bug class.
