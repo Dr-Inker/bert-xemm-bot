@@ -1,0 +1,15 @@
+[Unit]
+Description=Export sanitized BERT XEMM observer dashboard data
+After=bert-xemm-bot.service
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/bert-xemm-bot
+ExecStart=/usr/bin/node --enable-source-maps /opt/bert-xemm-bot/dist/exportDashboard.js
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/var/lib/bert-xemm-bot
+ReadWritePaths=/var/www/drinkerlabs/bert-mm
