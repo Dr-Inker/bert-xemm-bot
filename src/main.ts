@@ -14,6 +14,7 @@ import { trustedMid } from './priceOracle.js';
 import { Raydium24hVol } from './venues/raydium24hVol.js';
 import { PnlTracker } from './strategy/pnlTracker.js';
 import { AdverseFillTracker } from './strategy/adverseFillTracker.js';
+import { measureObserverEconomics } from './observerEconomics.js';
 import {
   condNetDelta, condKraken24hMin, condSolUsd1hMove, condStaleData,
   condRpcBurn, condRaydium24hMin, condDailyPnl, condAdverseFill,
@@ -74,8 +75,10 @@ async function main(): Promise<void> {
     },
     notifier: { page: (m) => { void notifier.critical(m); } },
   });
-  const ok = await reconciler.run();
-  if (!ok) { logger.error('reconciler refused startup'); process.exit(1); }
+  if (cfg.mode === 'live') {
+    const ok = await reconciler.run();
+    if (!ok) { logger.error('reconciler refused startup'); process.exit(1); }
+  }
 
   // HedgeExecutor wired against StateStore + Solana RPC txStatus adapter.
   // Spec section 5.5: poll getSignatureStatus every 2s up to 30s, then retry up to 3x.
@@ -204,13 +207,18 @@ async function main(): Promise<void> {
 
   const quoter = new QuoterLoop({
     cex, store,
+    executeIntents: cfg.mode === 'live',
     readInputs: async () => {
       const mid = await dex.poolMidUsd();
+      const book = bookCache.snapshot();
+      const topBid = book.bids[0]?.price;
+      const topAsk = book.asks[0]?.price;
+      const krakenMid = topBid && topAsk ? topBid.plus(topAsk).div(2) : null;
       const trust = trustedMid({
-        samples: [
+        samples: krakenMid ? [
           { source: 'raydium', midUsd: mid.mid.toString() },
-          { source: 'jupiter', midUsd: mid.mid.toString() },
-        ],
+          { source: 'kraken', midUsd: krakenMid.toString() },
+        ] : [{ source: 'raydium', midUsd: mid.mid.toString() }],
         maxDivergenceBps: cfg.oracleDivergenceBps,
       });
       const balances = await cex.balances();
@@ -223,7 +231,7 @@ async function main(): Promise<void> {
       return {
         ref: { raydiumMidUsd: mid.mid, solUsd: mid.solUsd, asOf: mid.asOf },
         oracleTrusted: trust.trusted,
-        krakenBook: bookCache.snapshot(),
+        krakenBook: book,
         openOrders: await cex.openOrders(),
         inventory: snap,
         feeTier: fee,
@@ -248,20 +256,53 @@ async function main(): Promise<void> {
   );
   const wdLoop = new WatchdogLoop(watchdog, cfg.watchdog.cadenceMs, logger);
 
-  // Observer mode must NEVER place orders. Override CEX placeLimit at runtime so the
-  // quoter can still compute intents and log them via basis_samples, but never submit.
-  if (cfg.mode === 'observer') {
-    const origPlace = cex.placeLimit.bind(cex);
-    cex.placeLimit = async (_p) => {
-      logger.info({ mode: 'observer' }, 'placeLimit suppressed in observer mode');
-      return 'OBSERVER-NO-OP';
-    };
-    void origPlace; // retained for symmetry; never used while mode === observer
-  }
-
   const quoterTimer = setInterval(() => {
     quoter.tick().catch(e => logger.error({ err: e }, 'quoter tick'));
   }, cfg.quoter.cadenceMs);
+
+  const observerTick = async (): Promise<void> => {
+    const book = bookCache.snapshot();
+    const bid = book.bids[0]?.price;
+    const ask = book.asks[0]?.price;
+    if (!bid || !ask) { logger.warn('observer: waiting for complete Kraken book'); return; }
+    const mid = await dex.poolMidUsd();
+    const bookAgeMs = Math.max(0, Date.now() - book.t.getTime());
+    const crossVenueTrust = trustedMid({
+      samples: [
+        { source: 'raydium', midUsd: mid.mid.toString() },
+        { source: 'kraken', midUsd: bid.plus(ask).div(2).toString() },
+      ],
+      maxDivergenceBps: cfg.oracleDivergenceBps,
+    });
+    const oracleTrusted = crossVenueTrust.trusted && bookAgeMs <= cfg.observer.maxBookAgeSec * 1000;
+    const fee = await cex.feeTier();
+    for (const rawSize of cfg.observer.sizesBert) {
+      try {
+        const sizeBert = new Decimal(rawSize);
+        const e = await measureObserverEconomics({
+          sizeBert, krakenBid: bid, krakenAsk: ask, raydiumMidUsd: mid.mid,
+          solUsd: mid.solUsd, makerFeeBps: fee.makerBps,
+          jupiterBaseUrl: cfg.jupiter.baseUrl, slippageBps: cfg.jupiter.maxSlippageBps,
+        });
+        store.insertObserverSample({
+          t: new Date().toISOString(), sizeBert: sizeBert.toString(),
+          raydiumMidUsd: mid.mid.toString(), krakenBid: bid.toString(), krakenAsk: ask.toString(),
+          dexSellPriceUsd: e.dexSellPriceUsd.toString(), dexBuyPriceUsd: e.dexBuyPriceUsd.toString(),
+          makerFeeBps: fee.makerBps, buyMakerEdgeBps: e.buyMakerEdgeBps.toString(),
+          sellMakerEdgeBps: e.sellMakerEdgeBps.toString(), dexSellImpactBps: e.dexSellImpactBps.toString(),
+          dexBuyImpactBps: e.dexBuyImpactBps.toString(), bookAgeMs, oracleTrusted,
+        });
+        logger.info({ sizeBert: rawSize, buyEdgeBps: e.buyMakerEdgeBps.toFixed(1), sellEdgeBps: e.sellMakerEdgeBps.toFixed(1), oracleTrusted }, 'observer: executable edge sampled');
+      } catch (err) {
+        logger.warn({ err, sizeBert: rawSize }, 'observer: executable quote sample failed');
+      }
+    }
+  };
+  let observerTimer: NodeJS.Timeout | undefined;
+  if (cfg.mode === 'observer') {
+    observerTimer = setInterval(() => void observerTick().catch(err => logger.error({ err }, 'observer tick')), cfg.observer.sampleCadenceMs);
+    void observerTick().catch(err => logger.error({ err }, 'observer initial tick'));
+  }
 
   // Heartbeat ticker — touches the file every 5s so ops/heartbeat-check.sh sees
   // a fresh mtime. Independent of the three main loops so any one of them
@@ -274,12 +315,13 @@ async function main(): Promise<void> {
   if (cfg.mode !== 'observer') {
     fillLoop.run().catch(e => logger.error({ err: e }, 'fillLoop crashed'));
   }
-  wdLoop.start();
+  if (cfg.mode === 'live') wdLoop.start();
 
   process.on('SIGINT', () => {
     logger.info('SIGINT received, shutting down');
     clearInterval(quoterTimer);
     clearInterval(heartbeatTimer);
+    if (observerTimer) clearInterval(observerTimer);
     wdLoop.stop();
     fillLoop.shutdown();
     bookCache.shutdown();

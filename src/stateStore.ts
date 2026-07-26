@@ -22,6 +22,14 @@ export interface BasisSampleRow {
   wouldHaveActed: boolean;
 }
 
+export interface ObserverSampleRow {
+  t: string; sizeBert: string; raydiumMidUsd: string; krakenBid: string; krakenAsk: string;
+  dexSellPriceUsd: string; dexBuyPriceUsd: string; makerFeeBps: number;
+  buyMakerEdgeBps: string; sellMakerEdgeBps: string;
+  dexSellImpactBps: string; dexBuyImpactBps: string;
+  bookAgeMs: number; oracleTrusted: boolean;
+}
+
 export class StateStore {
   private db: DB;
   constructor(path: string) {
@@ -72,6 +80,16 @@ export class StateStore {
         would_have_acted INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_basis_t ON basis_samples(t);
+      CREATE TABLE IF NOT EXISTS observer_samples (
+        t TEXT NOT NULL, size_bert TEXT NOT NULL, raydium_mid_usd TEXT NOT NULL,
+        kraken_bid TEXT NOT NULL, kraken_ask TEXT NOT NULL,
+        dex_sell_price_usd TEXT NOT NULL, dex_buy_price_usd TEXT NOT NULL,
+        maker_fee_bps REAL NOT NULL, buy_maker_edge_bps TEXT NOT NULL,
+        sell_maker_edge_bps TEXT NOT NULL, dex_sell_impact_bps TEXT NOT NULL,
+        dex_buy_impact_bps TEXT NOT NULL, book_age_ms INTEGER NOT NULL,
+        oracle_trusted INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_observer_samples_t_size ON observer_samples(t, size_bert);
       CREATE TABLE IF NOT EXISTS kill_events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         t TEXT NOT NULL,
@@ -119,6 +137,36 @@ export class StateStore {
       FROM basis_samples ORDER BY t DESC LIMIT ?
     `).all(limit) as Array<Omit<BasisSampleRow, 'wouldHaveActed'> & { wouldHaveActed: number }>;
     return rows.map(r => ({ ...r, wouldHaveActed: r.wouldHaveActed === 1 }));
+  }
+
+  insertObserverSample(r: ObserverSampleRow): void {
+    this.db.prepare(`
+      INSERT INTO observer_samples (
+        t, size_bert, raydium_mid_usd, kraken_bid, kraken_ask,
+        dex_sell_price_usd, dex_buy_price_usd, maker_fee_bps,
+        buy_maker_edge_bps, sell_maker_edge_bps, dex_sell_impact_bps,
+        dex_buy_impact_bps, book_age_ms, oracle_trusted
+      ) VALUES (
+        @t, @sizeBert, @raydiumMidUsd, @krakenBid, @krakenAsk,
+        @dexSellPriceUsd, @dexBuyPriceUsd, @makerFeeBps,
+        @buyMakerEdgeBps, @sellMakerEdgeBps, @dexSellImpactBps,
+        @dexBuyImpactBps, @bookAgeMs, @oracleTrusted
+      )
+    `).run({ ...r, oracleTrusted: r.oracleTrusted ? 1 : 0 });
+  }
+
+  recentObserverSamples(limit: number): ObserverSampleRow[] {
+    const rows = this.db.prepare(`
+      SELECT t, size_bert AS sizeBert, raydium_mid_usd AS raydiumMidUsd,
+        kraken_bid AS krakenBid, kraken_ask AS krakenAsk,
+        dex_sell_price_usd AS dexSellPriceUsd, dex_buy_price_usd AS dexBuyPriceUsd,
+        maker_fee_bps AS makerFeeBps, buy_maker_edge_bps AS buyMakerEdgeBps,
+        sell_maker_edge_bps AS sellMakerEdgeBps, dex_sell_impact_bps AS dexSellImpactBps,
+        dex_buy_impact_bps AS dexBuyImpactBps, book_age_ms AS bookAgeMs,
+        oracle_trusted AS oracleTrusted
+      FROM observer_samples ORDER BY t DESC LIMIT ?
+    `).all(limit) as Array<Omit<ObserverSampleRow, 'oracleTrusted'> & { oracleTrusted: number }>;
+    return rows.map(r => ({ ...r, oracleTrusted: r.oracleTrusted === 1 }));
   }
 
   setFlag(key: string, value: string): void {

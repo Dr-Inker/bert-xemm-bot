@@ -33,6 +33,20 @@ describe('StateStore', () => {
     expect(rows[0]?.raydiumMidUsd).toBe('0.0177');
   });
 
+  it('round-trips executable observer economics', () => {
+    store.insertObserverSample({
+      t: '2026-07-26T00:00:00Z', sizeBert: '5000', raydiumMidUsd: '0.0097',
+      krakenBid: '0.0095', krakenAsk: '0.0101', dexSellPriceUsd: '0.00965',
+      dexBuyPriceUsd: '0.00971', makerFeeBps: 23, buyMakerEdgeBps: '120',
+      sellMakerEdgeBps: '350', dexSellImpactBps: '4', dexBuyImpactBps: '5',
+      bookAgeMs: 500, oracleTrusted: true,
+    });
+    const rows = store.recentObserverSamples(1);
+    expect(rows[0]?.sizeBert).toBe('5000');
+    expect(rows[0]?.oracleTrusted).toBe(true);
+    expect(rows[0]?.makerFeeBps).toBe(23);
+  });
+
   it('withTransaction rolls back on throw', () => {
     expect(() => store.withTransaction(() => {
       store.insertOrder({

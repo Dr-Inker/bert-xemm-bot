@@ -18,7 +18,7 @@ raydium:
   rpcUrl: https://api.mainnet-beta.solana.com
   jitoBlockEngine: mainnet.block-engine.jito.wtf
 jupiter:
-  baseUrl: https://quote-api.jup.ag/v6
+  baseUrl: https://lite-api.jup.ag/swap/v1
   maxSlippageBps: 50
 quoter:
   cadenceMs: 2500

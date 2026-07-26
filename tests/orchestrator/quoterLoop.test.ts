@@ -117,4 +117,23 @@ describe('QuoterLoop.tick', () => {
     await loop.tick();
     expect(venue.placeLimit).not.toHaveBeenCalled();
   });
+
+  it('records observer decisions without dispatching or creating synthetic orders', async () => {
+    const venue = { placeLimit: vi.fn(), amend: vi.fn(), cancel: vi.fn() };
+    const store = { insertBasisSample: vi.fn(), getFlag: vi.fn().mockReturnValue('1'), insertOrder: vi.fn() };
+    const inputs = {
+      ref: { raydiumMidUsd: new Decimal('0.0177'), solUsd: new Decimal('86'), asOf: new Date() },
+      oracleTrusted: true,
+      krakenBook: { pair: 'BERTUSD', bids: [{ price: new Decimal('0.0175'), volume: new Decimal('5000') }], asks: [{ price: new Decimal('0.0179'), volume: new Decimal('5000') }], t: new Date() },
+      openOrders: [], inventory: { bertNet: new Decimal(0), usdNet: new Decimal(0), asOf: new Date() },
+      feeTier: { makerBps: 23, takerBps: 40 }, dexCostBps: 35,
+      config: { bufferBps: 130, driftThresholdBps: 15, inventorySkewBpsPerUsd: 0, minEdgeBps: 20, maxInventoryUsd: 500, defaultVolumeBert: new Decimal(1000) },
+    };
+    const loop = new QuoterLoop({ cex: venue as never, store: store as never, executeIntents: false,
+      readInputs: async () => inputs, logger: { info: vi.fn(), error: vi.fn(), warn: vi.fn() } as never });
+    await loop.tick();
+    expect(store.insertBasisSample).toHaveBeenCalledOnce();
+    expect(venue.placeLimit).not.toHaveBeenCalled();
+    expect(store.insertOrder).not.toHaveBeenCalled();
+  });
 });

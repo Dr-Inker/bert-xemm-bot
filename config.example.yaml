@@ -36,9 +36,16 @@ raydium:
   jitoBlockEngine: mainnet.block-engine.jito.wtf
 
 jupiter:
-  baseUrl: https://quote-api.jup.ag/v6
+  baseUrl: https://lite-api.jup.ag/swap/v1
   # Max slippage tolerated on Jupiter swap quotes (bps). Hard-capped at 1000.
   maxSlippageBps: 50
+
+observer:
+  # Measure executable hedge economics at each of these BERT notionals.
+  sizesBert: [1000, 5000, 10000]
+  # Samples older than this are recorded as untrusted.
+  maxBookAgeSec: 15
+  sampleCadenceMs: 30000
 
 quoter:
   # Decision loop cadence (ms). Min 500, max 60_000.

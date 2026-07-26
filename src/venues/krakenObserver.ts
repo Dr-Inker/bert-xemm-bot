@@ -15,6 +15,7 @@ export interface KrakenObserverConfig {
  * Balances/open-orders are stubbed; mutations are no-ops.
  */
 export class KrakenObserver implements HedgeVenue {
+  private feeCache: { fee: FeeTier; at: number } | null = null;
   constructor(private cfg: KrakenObserverConfig) {}
 
   async *watchBook(pair: string, depth: number): AsyncIterable<BookSnapshot> {
@@ -54,7 +55,23 @@ export class KrakenObserver implements HedgeVenue {
   }
 
   async feeTier(): Promise<FeeTier> {
-    return { makerBps: 16, takerBps: 26 };
+    if (this.feeCache && Date.now() - this.feeCache.at < 3_600_000) return this.feeCache.fee;
+    try {
+      const r = await fetch(`https://api.kraken.com/0/public/AssetPairs?pair=${encodeURIComponent(this.cfg.pair)}`);
+      if (!r.ok) throw new Error(`Kraken AssetPairs ${r.status}`);
+      const body = await r.json() as { result?: Record<string, { fees_maker?: [number, number][]; fees?: [number, number][] }> };
+      const pair = Object.values(body.result ?? {})[0];
+      const makerPct = pair?.fees_maker?.[0]?.[1];
+      const takerPct = pair?.fees?.[0]?.[1];
+      if (makerPct === undefined || takerPct === undefined) throw new Error('fee schedule missing');
+      const fee = { makerBps: makerPct * 100, takerBps: takerPct * 100 };
+      this.feeCache = { fee, at: Date.now() };
+      return fee;
+    } catch {
+      // Conservative current entry-tier fallback; a failed lookup must never
+      // make an opportunity appear more profitable than it is.
+      return { makerBps: 23, takerBps: 40 };
+    }
   }
 
   async placeLimit(_p: PlaceLimitParams): Promise<string> {

@@ -25,6 +25,12 @@ export const BotConfigSchema = z.object({
     maxSlippageBps: z.number().int().positive().max(1000),
   }),
 
+  observer: z.object({
+    sizesBert: z.array(z.number().positive()).min(1).max(10).default([1000, 5000, 10000]),
+    maxBookAgeSec: z.number().int().positive().default(15),
+    sampleCadenceMs: z.number().int().min(5000).max(300_000).default(30_000),
+  }).default({ sizesBert: [1000, 5000, 10000], maxBookAgeSec: 15, sampleCadenceMs: 30_000 }),
+
   quoter: z.object({
     cadenceMs: z.number().int().min(500).max(60_000),
     bufferBps: z.number().nonnegative(),

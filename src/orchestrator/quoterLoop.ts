@@ -11,12 +11,14 @@ export interface QuoterLoopOpts {
   };
   readInputs: () => Promise<QuoterInput>;
   logger: Logger;
+  executeIntents?: boolean;
 }
 
 export class QuoterLoop {
   constructor(private o: QuoterLoopOpts) {}
   async tick(): Promise<void> {
-    if (this.o.store.getFlag('degraded') === '1') {
+    const executeIntents = this.o.executeIntents ?? true;
+    if (executeIntents && this.o.store.getFlag('degraded') === '1') {
       this.o.logger.info('quoter: degraded, skipping');
       return;
     }
@@ -33,6 +35,10 @@ export class QuoterLoop {
       });
     } else {
       this.o.logger.warn('quoter: book incomplete, skipping basis sample');
+    }
+    if (!executeIntents) {
+      this.o.logger.info({ intents }, 'quoter: observer decisions recorded; dispatch disabled');
+      return;
     }
     for (const intent of intents) await this.dispatch(intent, now);
   }
