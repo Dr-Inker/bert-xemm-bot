@@ -1,10 +1,10 @@
 # bert-xemm-bot — Project Instructions
 
-CEX-DEX hedged market maker. Quotes BERT/USD post-only on Kraken (via the `kraken` binary subprocess); hedges fills on Raydium AMM v4 via Jupiter v6 with Jito bundles.
+CEX-DEX hedged market-maker research and gated execution system. Observer mode reads Kraken public book/trades and executable Solana routes; live mode can quote Kraken and hedge through Jupiter.
 
-**Status as of 2026-05-23: Paper mode removed. BookCache merge fix + QuoterLoop empty-book guard + AdverseFillTracker minResolved guard landed. Ready for clean 48h observer run per docs/superpowers/specs/2026-05-23-fast-track-live-design.md.**
+**Status as of 2026-07-26: deployed observer-only with $0 capital. Executable economics are sampled at 1k/5k/10k BERT. A local conservative paper ledger uses public Kraken trades, L2 queue-ahead estimates, fresh Jupiter hedges and explicit friction attribution. Sanitized telemetry is published at `https://drinkerlabs.info/bert-mm/`. Real dispatch remains disabled.**
 
-**Successor to** the retired bert-mm-bot at `/opt/bert-mm-bot` (Meteora DLMM MM, retired 2026-05-20 after the pool died).
+**Companion to** `/opt/bert-mm-bot`, which remains the separate on-chain BERT/SOL liquidity manager. Do not describe XEMM as replacing the DEX bot.
 
 ## Layout
 
@@ -13,7 +13,10 @@ src/
 ├── main.ts                       # Orchestrator entry. Wires venues + three loops.
 ├── config.ts                     # zod-validated YAML schema (BotConfigSchema)
 ├── logger.ts                     # pino, service=bert-xemm-bot
-├── stateStore.ts                 # better-sqlite3 WAL; orders/fills/hedges/basis_samples/kill_events/flags
+├── stateStore.ts                 # SQLite WAL; live state + observer_samples + paper_orders + paper_fills
+├── observerEconomics.ts          # size-specific executable two-way hedge economics
+├── paperFillEngine.ts            # public-trade queue model + friction-attributed theoretical PnL
+├── exportDashboard.ts            # read-only SQLite → sanitized atomic dashboard JSON
 ├── notifier.ts                   # Telegram + Discord webhook severity ladder
 ├── priceOracle.ts                # trustedMid(): median + max-min divergence trust gate
 ├── types.ts                      # Order/Fill/OrderUpdate/BookSnapshot/FeeTier + newClOrdId
@@ -25,13 +28,14 @@ src/
 │   ├── hedgeVenue.ts             # HedgeVenue interface + VenueError class
 │   ├── krakenClient.ts           # Kraken CLI subprocess wrapper (mutations, amend, streams, queries)
 │   ├── krakenObserver.ts         # Observer-mode CEX: public WS book only, no API keys, mutations are no-ops
+│   ├── krakenPublicTrades.ts     # public trades stream used only by the local paper ledger
 │   ├── krakenPair.ts             # toWsPair(): config pair → Kraken WS-style pair (BERTUSD → BERT/USD)
 │   ├── krakenStream.ts           # spawn + readline NDJSON for ws streams
 │   ├── krakenErrors.ts           # Map Kraken CLI error envelope → VenueError
 │   ├── bookCache.ts              # In-memory top-of-book; subscribes to cex.watchBook(pair, depth)
 │   ├── dexVenue.ts               # DexVenue interface + Asset/PoolMid/SwapQuote types
 │   ├── raydiumAmmClient.ts       # On-chain reserve reads + Jupiter swap submission
-│   └── jupiterApi.ts             # Jupiter v6 /quote + /swap HTTP client (mints + decimals)
+│   └── jupiterApi.ts             # Jupiter Swap API /quote + /swap client (mints + decimals)
 ├── strategy/
 │   ├── xemmQuoter.ts             # decideQuotes(input) → QuoteIntent[]. Pure decision function.
 │   ├── netDeltaTracker.ts        # Cross-venue BERT inventory aggregator (signed delta)
@@ -51,10 +55,11 @@ src/
 
 scripts/
 ├── kraken-cancel-all.ts          # Operator helper: KrakenClient.cancelAll()
-├── emergency-exit.ts             # Currently a stub — venue wiring not duplicated from main.ts (gap)
+├── emergency-exit.ts             # Operator emergency unwind entrypoint
 └── rehearsal.ts                  # 60s dry-run, no submission, uses hardcoded synthetic inputs
 
-systemd/bert-xemm-bot.service     # Hardened systemd unit (bertxemm user, NoNewPrivileges, ProtectSystem=strict)
+systemd/bert-xemm-bot.service     # Hardened observer/live service
+systemd/bert-xemm-dashboard-export.{service,timer} # 1-minute sanitized static export
 ops/heartbeat-check.sh            # Watchdog: heartbeat file age check
 ops/logrotate.conf                # Daily rotate, 7-day retention, copytruncate
 ops/install.sh                    # Idempotent installer (creates user, dirs, perms, copies units)
@@ -70,7 +75,8 @@ docs/
 
 ```bash
 pnpm install
-pnpm test         # 91 passing
+pnpm test         # 104 passing as of 2026-07-26
+pnpm lint
 pnpm build
 pnpm cli status   # default config: /etc/bert-xemm-bot/config.yaml
 ```
@@ -83,14 +89,19 @@ pnpm cli status   # default config: /etc/bert-xemm-bot/config.yaml
 - **Profitability gate** in `decideQuotes`: must clear `bufferBps − (makerBps + dexCostBps) ≥ minEdgeBps`. Original spec had a bug here that ignored fees; was corrected in commit `8c6c5c3`. Don't revert.
 - **Fail-closed reconciliation**: `Reconciler.run()` must return true before the orchestrator starts. Any venue/DB drift sets `degraded=1` and pages.
 - **Degraded flag**: stored in `flags` table (`flags.degraded='1'`). Quoter checks every tick and falls silent. Watchdog never auto-clears — operator runs `pnpm cli resume`.
+- **Observer dispatch boundary**: `QuoterLoop.executeIntents=false`; never call venue mutations and never persist synthetic live orders. Live reconciliation/fill/watchdog loops do not start in observer mode.
+- **Paper fill truth**: a book touch is not a fill. Only subsequent Kraken public traded volume that reaches the paper price and consumes estimated queue-ahead volume may create `paper_fills`.
+- **Paper friction**: theoretical net PnL deducts the actual public maker tier, executable DEX route, fixed transaction cost, configured latency penalty and failed-hedge reserve.
+- **Dashboard boundary**: exporter opens SQLite read-only and publishes sanitized static JSON. Never expose SQLite, secrets, wallet paths, RPC credentials or trading controls to the website.
 
 ## Phase progression
 
-Per the fast-track design (2026-05-23), paper mode is removed; the strategy is validated by observer data then by small live capital.
+The broken Kraken CLI paper mode remains removed. It has been replaced by a local, public-data-derived conservative paper ledger; it never invokes broker paper endpoints or venue mutations.
 
-1. **Observer (48h)** — `mode: observer`. No orders. Logs basis distribution. **Go/no-go gate is distribution-driven**, not a single threshold — see `docs/superpowers/specs/2026-05-23-fast-track-live-design.md` Phase C decision matrix. The legacy 14-day @ ≥5/day above 140bps is one row of that matrix.
-2. **Warm-up (live, size from observer histogram)** — `mode: live`. Manual operator gate per session. Hard ceiling for first session: $500.
-3. **Staged ramp** — $500 → $1K → $2K → $5K (hard ceiling for Kraken venue), days apart, gated on positive net PnL.
+1. **Observer + local paper ledger** — no keys, wallet, orders or capital. Collect executable edges and actual-trade-derived simulated fills across quiet and volatile regimes.
+2. **Go/no-go review** — require enough fills to evaluate net PnL, drawdown, direction/size stability and friction sensitivity. Snapshot edge alone is insufficient.
+3. **Minimum-size live canary** — only after separate explicit approval, restricted credentials and a documented capital/session cap.
+4. **Staged ramp** — gated on realised net PnL and operational reliability; never calendar-driven.
 
 ## Known gaps (audit 2026-05-20, integration passes 2026-05-21)
 
@@ -110,7 +121,7 @@ Original audit found 6 critical + 7 important gaps. After three integration pass
 9. ~~NetDeltaTracker fed `inFlightHedgesBert: new Decimal('0')`~~ — **Closed in `8dd62fc` + `3af8d50`.** `StateStore.sumInFlightHedgesBert()` reads `bert_notional` across non-terminal hedge statuses; wired into both `QuoterLoop.readInputs` and `evaluateConditions`.
 10. ~~Kraken book passed as `{ bids: [], asks: [] }`~~ — **Closed in `19131a7`.** `BookCache` subscribes to `cex.watchBook(pair, 10)` and exposes `snapshot()`. `basis_samples` now records real top-of-book bid/ask. Phase 1 go/no-go gate finally compares real numbers.
 11. ~~`condRpcBurn` halt threshold only~~ — Throttle tier deferred (not implemented — code only halts at `rpcCallsPerMinHalt`). Operational concern for v1.2; conservative side.
-12. ~~Observer mode does NOT gate order placement~~ — **Closed in `12232ed`** (`placeLimit` overridden to no-op when `mode === 'observer'`).
+12. ~~Observer mode does NOT gate order placement~~ — **Closed and strengthened.** `QuoterLoop.executeIntents=false` prevents dispatch and synthetic order persistence; observer mode also skips live reconciliation, fill execution and watchdog mutations.
 13. ~~Coverage gate fails~~ — **Closed.** Pure-logic modules at >95%, total 91.33% lines / 73% branches / 91% functions / 91% statements. Gate (85/70/85/85) passes.
 
 **Minor (mostly cosmetic, may revisit pre-live):**
@@ -122,14 +133,15 @@ Original audit found 6 critical + 7 important gaps. After three integration pass
 
 ## Readiness assessment
 
-- **Plumbing demo**: works today (91 tests pass, build clean).
-- **Observer**: **ready** — BookCache merge fix landed; `basis_samples` now records real Kraken book + real Raydium mid via DexScreener. Observer needs no API keys (uses `KrakenObserver` + public WS); only Solana Connection (free public RPC OK).
-- **Live warm-up**: hot-wallet keyfile loading is wired (`wire.ts::buildSigner` when `mode === 'live'`). Operator must place keyfile at `paths.keyfile` mode `0640 root:bertxemm` (the bot's group needs read; `0600` denies it) and verify Kraken API key permissions (Withdraw OFF).
+- **Validation**: 104 tests pass; TypeScript lint/build are clean as of 2026-07-26.
+- **Observer + paper ledger**: deployed and active. No API keys or hot wallet are loaded. Public book/trade streams, executable route sampling, trust gating and dashboard export are operational.
+- **Live warm-up**: implementation exists but is not approved. Do not fund or install credentials until the paper ledger has a representative fill history and an explicit operator go-live decision.
 
 ## Reference
 
-- **Current operating spec**: `docs/superpowers/specs/2026-05-23-fast-track-live-design.md` — the fast-track-to-live plan that supersedes the 2026-05-20 "Phase 1.5 ready" framing.
-- **Current implementation plan**: `docs/superpowers/plans/2026-05-23-fast-track-live.md` — 8 TDD tasks.
+- **Current operator docs**: `README.md` and `docs/DEPLOY.md`.
+- **Historical operating spec**: `docs/superpowers/specs/2026-05-23-fast-track-live-design.md` — retained for provenance; its fast-track/paper-removed progression is superseded by the 2026-07-26 local paper ledger.
+- **Historical implementation plan**: `docs/superpowers/plans/2026-05-23-fast-track-live.md`.
 - **Original v1 design spec**: `/opt/bert-mm-bot/docs/superpowers/specs/2026-05-20-bert-xemm-bot-design.md` (still in predecessor repo).
 - **Original v1 implementation plan**: `/opt/bert-mm-bot/docs/superpowers/plans/2026-05-20-bert-xemm-bot.md`.
 - **Predecessor scaffolding (read-only reference)**: `/opt/bert-mm-bot/src/` — for porting questions about notifier/stateStore/jitoClient patterns.
@@ -144,5 +156,5 @@ Original audit found 6 critical + 7 important gaps. After three integration pass
 - Don't add shell-interpolating subprocess calls. Route everything through `execFileNoThrow`.
 - Don't enable Kraken Withdraw permission on the bot's API key. Operator runs withdrawals manually or via a separate whitelist-bound key.
 - Don't revert the profitability gate fix in `8c6c5c3` — the gate must subtract round-trip costs from buffer, not compare buffer raw against minEdgeBps.
-- Don't go live until the Phase A bug-fixes land AND the 48h observer go/no-go gate passes per the fast-track design.
-- Don't re-add paper mode. The decision was data-driven (operator's "paper trading only does so much good") plus the paper subprocess was the source of the phantom-fill bug class.
+- Don't go live until the local paper ledger has representative public-trade-derived fills, positive stressed net PnL, acceptable drawdown and explicit operator approval.
+- Don't re-add Kraken CLI/broker paper mode. The allowed paper system is the local public-trade queue model in `paperFillEngine.ts`; preserve its no-touch-fill rule and explicit friction deductions.

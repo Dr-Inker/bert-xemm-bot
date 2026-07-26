@@ -1,39 +1,105 @@
-# Deploy
+# Deployment and operations
+
+## Current deployment
+
+The production service is intentionally `mode: observer`. It has no capital and cannot submit Kraken or Solana transactions.
+
+```bash
+systemctl status bert-xemm-bot.service
+systemctl status bert-xemm-dashboard-export.timer
+journalctl -u bert-xemm-bot -f
+```
+
+Public read-only dashboard: <https://drinkerlabs.info/bert-mm/>
 
 ## Prerequisites
 
-- Node 22 (`nvm use`)
+- Node.js 22
 - pnpm 9+
-- `kraken` binary on PATH (`/usr/local/bin/kraken`). Install per https://github.com/krakenfx/kraken-cli
-- A Solana hot wallet keyfile (JSON `number[]`) at the path configured in `config.yaml` (mode `0640 root:bertxemm`)
-- Kraken API key + secret with restricted scope (see README)
-- `/etc/bert-xemm-bot/config.yaml` (mode 0640, owner `root:bertxemm`)
-- `/etc/bert-xemm-bot/env` containing `KRAKEN_API_KEY=...`, `KRAKEN_API_SECRET=...`, `TELEGRAM_BOT_TOKEN=...` (mode 0640)
+- Kraken CLI at `/usr/local/bin/kraken`
+- `/etc/bert-xemm-bot/config.yaml`, mode `0640`, owner `root:bertxemm`
+- writable state directory `/var/lib/bert-xemm-bot`
 
-## Install
+Observer mode uses public Kraken book/trade streams and public Solana/Jupiter data. It does not require Kraken API credentials or the hot-wallet keyfile. Those are live-only prerequisites and must not be added merely to run research.
+
+## Build and install
 
 ```bash
 cd /opt/bert-xemm-bot
 pnpm install
+pnpm test
+pnpm lint
 pnpm build
 sudo ops/install.sh
-sudo systemctl enable --now bert-xemm-bot
-sudo journalctl -u bert-xemm-bot -f
+sudo systemctl enable --now bert-xemm-bot.service
 ```
 
-## Phase progression
-
-1. **Observer (48h):** `config.yaml` sets `mode: observer`, `enabled: true`. No orders placed; only basis sampled.
-2. **Warm-up:** `mode: live`, `enabled: true`, $100 capital. Manual gate per session.
-3. **Live:** `mode: live`, ramp $500 → $2K → $5K with kill switches enabled.
-
-## Phase 1 go/no-go gate
+Install the sanitized dashboard exporter:
 
 ```bash
-sudo -u bertxemm /opt/bert-xemm-bot/node_modules/.bin/tsx \
-  /opt/bert-xemm-bot/src/cli/index.ts basis-snapshot --since "$(date -d '14 days ago' -Iseconds)Z" \
-  > /tmp/basis.csv
-awk -F, 'NR>1 { diff = ($2 - ($3+$4)/2); if (diff < 0) diff = -diff; bps = diff/(($3+$4)/2)*10000; if (bps > 140) c++; total++ } END { print "crossings >140bps:", c, "/", total, "(", (c/total)*100, "% )" }' /tmp/basis.csv
+sudo install -m 0644 systemd/bert-xemm-dashboard-export.service /etc/systemd/system/
+sudo install -m 0644 systemd/bert-xemm-dashboard-export.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now bert-xemm-dashboard-export.timer
+sudo systemctl start bert-xemm-dashboard-export.service
 ```
 
-If <5 crossings/day above 140 bps → strategy dies. Stop here.
+The static dashboard page is served from `/var/www/drinkerlabs/bert-mm/`. The exporter reads SQLite in read-only mode and atomically publishes sanitized JSON there once per minute.
+
+## Post-deploy verification
+
+```bash
+pnpm test
+pnpm lint
+systemctl is-active bert-xemm-bot.service
+systemctl is-active bert-xemm-dashboard-export.timer
+pgrep -af 'kraken ws (book|trades) BERT/USD'
+curl -fsS https://drinkerlabs.info/bert-mm/data.json
+```
+
+Expected observer processes are one public Kraken book stream and one public Kraken trades stream. There must be no authenticated executions stream.
+
+Verify the database without mutating it:
+
+```sql
+SELECT status, COUNT(*) FROM paper_orders GROUP BY status;
+SELECT COUNT(*) AS fills, COALESCE(SUM(CAST(net_pnl_usd AS REAL)), 0) AS net_pnl
+FROM paper_fills;
+```
+
+Zero paper P&L before a qualifying public trade is correct. Do not manufacture test fills in the production database.
+
+## Paper accounting assumptions
+
+- Quotes are independent scenarios for 1k, 5k and 10k BERT on each side.
+- Queue ahead is estimated from displayed L2 volume at or better than the simulated price.
+- Only subsequent Kraken public trades can consume the queue and trigger a paper fill.
+- Hedge economics are refreshed from Jupiter at simulated fill time.
+- Net P&L deducts maker fee, fixed transaction cost, latency penalty and failed-hedge reserve.
+- Stale/untrusted observations cancel outstanding paper quotes.
+
+This is deliberately conservative but still a model. It cannot perfectly reconstruct Kraken queue priority from L2 data.
+
+## Live promotion
+
+There is no calendar-based automatic promotion. Moving from observer to live requires explicit operator approval after reviewing:
+
+- actual public-trade-derived fill count and fill rate;
+- P&L by direction and size;
+- total friction attribution;
+- maximum drawdown and adverse-selection behavior;
+- hedge quote reliability and failure rate;
+- sensitivity to stricter latency and failure reserves.
+
+If approved later, use a separate restricted Kraken key with Withdraw disabled and a minimally funded Solana hot wallet. Begin at the exchange minimum, with a hard session cap and manual rollback.
+
+## Rollback
+
+Observer rollback is non-destructive:
+
+```bash
+sudo systemctl stop bert-xemm-bot.service
+sudo systemctl stop bert-xemm-dashboard-export.timer
+```
+
+The SQLite database and static JSON remain available for analysis. Do not delete state during rollback.
