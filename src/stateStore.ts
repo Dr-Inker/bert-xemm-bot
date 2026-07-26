@@ -90,6 +90,21 @@ export class StateStore {
         oracle_trusted INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_observer_samples_t_size ON observer_samples(t, size_bert);
+      CREATE TABLE IF NOT EXISTS paper_orders (
+        paper_order_id TEXT PRIMARY KEY, side TEXT NOT NULL, price TEXT NOT NULL,
+        size_bert TEXT NOT NULL, queue_ahead_bert TEXT NOT NULL, expected_edge_bps TEXT NOT NULL,
+        status TEXT NOT NULL, placed_at TEXT NOT NULL, updated_at TEXT NOT NULL, close_reason TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_paper_orders_status ON paper_orders(status);
+      CREATE TABLE IF NOT EXISTS paper_fills (
+        paper_fill_id TEXT PRIMARY KEY, paper_order_id TEXT NOT NULL, kraken_trade_id INTEGER NOT NULL,
+        side TEXT NOT NULL, fill_price_usd TEXT NOT NULL, volume_bert TEXT NOT NULL,
+        dex_hedge_price_usd TEXT NOT NULL, gross_pnl_usd TEXT NOT NULL, maker_fee_usd TEXT NOT NULL,
+        transaction_cost_usd TEXT NOT NULL, latency_cost_usd TEXT NOT NULL,
+        failure_reserve_usd TEXT NOT NULL, net_pnl_usd TEXT NOT NULL, dex_impact_bps TEXT NOT NULL,
+        t TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_paper_fills_t ON paper_fills(t);
       CREATE TABLE IF NOT EXISTS kill_events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         t TEXT NOT NULL,
@@ -167,6 +182,31 @@ export class StateStore {
       FROM observer_samples ORDER BY t DESC LIMIT ?
     `).all(limit) as Array<Omit<ObserverSampleRow, 'oracleTrusted'> & { oracleTrusted: number }>;
     return rows.map(r => ({ ...r, oracleTrusted: r.oracleTrusted === 1 }));
+  }
+
+  upsertPaperOrder(r: { paperOrderId: string; side: 'buy'|'sell'; price: string; sizeBert: string; queueAheadBert: string; expectedEdgeBps: string; placedAt: string; updatedAt: string }): void {
+    this.db.prepare(`INSERT INTO paper_orders
+      (paper_order_id, side, price, size_bert, queue_ahead_bert, expected_edge_bps, status, placed_at, updated_at)
+      VALUES (@paperOrderId,@side,@price,@sizeBert,@queueAheadBert,@expectedEdgeBps,'open',@placedAt,@updatedAt)
+      ON CONFLICT(paper_order_id) DO UPDATE SET queue_ahead_bert=excluded.queue_ahead_bert, updated_at=excluded.updated_at
+    `).run(r);
+  }
+
+  cancelPaperOrder(id: string, t: string, reason: string): void {
+    this.db.prepare(`UPDATE paper_orders SET status=?, close_reason=?, updated_at=? WHERE paper_order_id=?`).run(reason === 'filled' ? 'filled' : 'cancelled', reason, t, id);
+  }
+
+  cancelAllOpenPaperOrders(t: string, reason: string): void {
+    this.db.prepare(`UPDATE paper_orders SET status='cancelled', close_reason=?, updated_at=? WHERE status='open'`).run(reason, t);
+  }
+
+  insertPaperFill(r: Record<string, string | number>): void {
+    this.db.prepare(`INSERT OR IGNORE INTO paper_fills
+      (paper_fill_id,paper_order_id,kraken_trade_id,side,fill_price_usd,volume_bert,dex_hedge_price_usd,
+       gross_pnl_usd,maker_fee_usd,transaction_cost_usd,latency_cost_usd,failure_reserve_usd,net_pnl_usd,dex_impact_bps,t)
+      VALUES (@paperFillId,@paperOrderId,@krakenTradeId,@side,@fillPriceUsd,@volumeBert,@dexHedgePriceUsd,
+       @grossPnlUsd,@makerFeeUsd,@transactionCostUsd,@latencyCostUsd,@failureReserveUsd,@netPnlUsd,@dexImpactBps,@t)
+    `).run(r);
   }
 
   setFlag(key: string, value: string): void {

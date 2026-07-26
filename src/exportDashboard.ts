@@ -9,6 +9,11 @@ interface RawSample {
   dex_sell_impact_bps: string; dex_buy_impact_bps: string;
   book_age_ms: number; oracle_trusted: number;
 }
+interface RawPaperFill {
+  paper_fill_id: string; side: string; volume_bert: string; gross_pnl_usd: string;
+  maker_fee_usd: string; transaction_cost_usd: string; latency_cost_usd: string;
+  failure_reserve_usd: string; net_pnl_usd: string; t: string;
+}
 
 const dbPath = process.env['BERT_XEMM_DB'] ?? '/var/lib/bert-xemm-bot/state.db';
 const outputPath = process.env['BERT_XEMM_DASHBOARD_JSON'] ?? '/var/www/drinkerlabs/bert-mm/data.json';
@@ -17,6 +22,10 @@ const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
 const rows = db.prepare(`
   SELECT * FROM observer_samples WHERE t >= ? ORDER BY t DESC LIMIT 3000
 `).all(since) as RawSample[];
+const paperRows = db.prepare(`SELECT paper_fill_id,side,volume_bert,gross_pnl_usd,maker_fee_usd,
+  transaction_cost_usd,latency_cost_usd,failure_reserve_usd,net_pnl_usd,t
+  FROM paper_fills WHERE t >= ? ORDER BY t ASC`).all(since) as RawPaperFill[];
+const openPaperOrders = (db.prepare(`SELECT COUNT(*) n FROM paper_orders WHERE status='open'`).get() as { n: number }).n;
 db.close();
 
 const samples = rows.map(r => ({
@@ -43,6 +52,15 @@ const bySize = sizes.map(sizeBert => {
   };
 });
 const latestT = samples[0]?.t ?? null;
+let equity = 0, peak = 0, maxDrawdownUsd = 0;
+const paperFills = paperRows.map(r => {
+  const fill = { id:r.paper_fill_id, side:r.side, volumeBert:Number(r.volume_bert), grossPnlUsd:Number(r.gross_pnl_usd),
+    makerFeeUsd:Number(r.maker_fee_usd), transactionCostUsd:Number(r.transaction_cost_usd), latencyCostUsd:Number(r.latency_cost_usd),
+    failureReserveUsd:Number(r.failure_reserve_usd), netPnlUsd:Number(r.net_pnl_usd), t:r.t };
+  equity += fill.netPnlUsd; peak = Math.max(peak, equity); maxDrawdownUsd = Math.max(maxDrawdownUsd, peak - equity);
+  return { ...fill, cumulativePnlUsd: equity };
+});
+const sum = (key: keyof (typeof paperFills)[number]): number => paperFills.reduce((n, x) => n + Number(x[key]), 0);
 const payload = {
   schemaVersion: 1,
   generatedAt: new Date().toISOString(),
@@ -53,6 +71,14 @@ const payload = {
   trustedShare24h: samples.length ? trusted.length / samples.length : null,
   bySize,
   samples: samples.slice(0, 720).reverse(),
+  paper: {
+    openOrders: openPaperOrders, fills24h: paperFills.length,
+    wins24h: paperFills.filter(x => x.netPnlUsd > 0).length,
+    grossPnlUsd24h: sum('grossPnlUsd'), netPnlUsd24h: sum('netPnlUsd'),
+    makerFeesUsd24h: sum('makerFeeUsd'), transactionCostsUsd24h: sum('transactionCostUsd'),
+    latencyCostsUsd24h: sum('latencyCostUsd'), failureReserveUsd24h: sum('failureReserveUsd'),
+    maxDrawdownUsd24h: maxDrawdownUsd, recentFills: paperFills.slice(-20).reverse(),
+  },
 };
 await mkdir(dirname(outputPath), { recursive: true });
 const tmp = `${outputPath}.tmp`;

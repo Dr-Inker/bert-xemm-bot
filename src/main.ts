@@ -15,6 +15,8 @@ import { Raydium24hVol } from './venues/raydium24hVol.js';
 import { PnlTracker } from './strategy/pnlTracker.js';
 import { AdverseFillTracker } from './strategy/adverseFillTracker.js';
 import { measureObserverEconomics } from './observerEconomics.js';
+import { PaperFillEngine, type PaperQuoteCandidate } from './paperFillEngine.js';
+import { KrakenPublicTrades } from './venues/krakenPublicTrades.js';
 import {
   condNetDelta, condKraken24hMin, condSolUsd1hMove, condStaleData,
   condRpcBurn, condRaydium24hMin, condDailyPnl, condAdverseFill,
@@ -113,6 +115,34 @@ async function main(): Promise<void> {
 
   const bookCache = new BookCache(cfg.kraken.pair, logger);
   bookCache.run(cex, cfg.kraken.pair, 10).catch(e => logger.error({ err: e }, 'bookCache run crashed'));
+  const publicTrades = new KrakenPublicTrades(cfg.kraken.cliBinaryPath, cfg.kraken.pair, logger);
+  store.cancelAllOpenPaperOrders(new Date().toISOString(), 'process_restart');
+  const paper = new PaperFillEngine({
+    minNetEdgeBps: cfg.paper.minNetEdgeBps,
+    driftThresholdBps: cfg.quoter.driftThresholdBps,
+    latencyPenaltyBps: cfg.paper.latencyPenaltyBps,
+    failedHedgeReserveBps: cfg.paper.failedHedgeReserveBps,
+    transactionCostUsd: cfg.paper.transactionCostUsd,
+    store,
+    hedgeAtFill: async (side, size, fillPrice) => {
+      const mid = await dex.poolMidUsd();
+      const fee = await cex.feeTier();
+      const e = await measureObserverEconomics({
+        sizeBert: size, krakenBid: fillPrice, krakenAsk: fillPrice,
+        raydiumMidUsd: mid.mid, solUsd: mid.solUsd, makerFeeBps: fee.makerBps,
+        jupiterBaseUrl: cfg.jupiter.baseUrl, slippageBps: cfg.jupiter.maxSlippageBps,
+      });
+      return {
+        dexPriceUsd: side === 'buy' ? e.dexSellPriceUsd : e.dexBuyPriceUsd,
+        makerFeeUsd: fillPrice.mul(size).mul(fee.makerBps).div(10_000),
+        dexImpactBps: side === 'buy' ? e.dexSellImpactBps : e.dexBuyImpactBps,
+      };
+    },
+  });
+  publicTrades.onTrade(t => paper.onTrade(t));
+  if (cfg.mode === 'observer' && cfg.paper.enabled) {
+    publicTrades.run().catch(e => logger.error({ err: e }, 'public trades stream crashed'));
+  }
 
   const solUsdHist = new SolUsdHistory();
   const kraken24h = new Kraken24hVol(cfg.kraken.pair);
@@ -264,7 +294,10 @@ async function main(): Promise<void> {
     const book = bookCache.snapshot();
     const bid = book.bids[0]?.price;
     const ask = book.asks[0]?.price;
-    if (!bid || !ask) { logger.warn('observer: waiting for complete Kraken book'); return; }
+    if (!bid || !ask) {
+      if (cfg.paper.enabled) paper.updateQuotes([]);
+      logger.warn('observer: waiting for complete Kraken book'); return;
+    }
     const mid = await dex.poolMidUsd();
     const bookAgeMs = Math.max(0, Date.now() - book.t.getTime());
     const crossVenueTrust = trustedMid({
@@ -276,6 +309,7 @@ async function main(): Promise<void> {
     });
     const oracleTrusted = crossVenueTrust.trusted && bookAgeMs <= cfg.observer.maxBookAgeSec * 1000;
     const fee = await cex.feeTier();
+    const paperCandidates: PaperQuoteCandidate[] = [];
     for (const rawSize of cfg.observer.sizesBert) {
       try {
         const sizeBert = new Decimal(rawSize);
@@ -292,11 +326,24 @@ async function main(): Promise<void> {
           sellMakerEdgeBps: e.sellMakerEdgeBps.toString(), dexSellImpactBps: e.dexSellImpactBps.toString(),
           dexBuyImpactBps: e.dexBuyImpactBps.toString(), bookAgeMs, oracleTrusted,
         });
+        const fixedCostBps = sizeBert.mul(mid.mid).gt(0)
+          ? new Decimal(cfg.paper.transactionCostUsd).div(sizeBert.mul(mid.mid)).mul(10_000)
+          : new Decimal(0);
+        const requiredBps = new Decimal(fee.makerBps + cfg.paper.minNetEdgeBps + cfg.paper.latencyPenaltyBps + cfg.paper.failedHedgeReserveBps).plus(fixedCostBps);
+        paperCandidates.push({
+          sizeBert, side: 'buy', price: e.dexSellPriceUsd.div(new Decimal(1).plus(requiredBps.div(10_000))),
+          expectedEdgeBps: new Decimal(cfg.paper.minNetEdgeBps), book, oracleTrusted,
+        });
+        paperCandidates.push({
+          sizeBert, side: 'sell', price: e.dexBuyPriceUsd.mul(new Decimal(1).plus(requiredBps.div(10_000))),
+          expectedEdgeBps: new Decimal(cfg.paper.minNetEdgeBps), book, oracleTrusted,
+        });
         logger.info({ sizeBert: rawSize, buyEdgeBps: e.buyMakerEdgeBps.toFixed(1), sellEdgeBps: e.sellMakerEdgeBps.toFixed(1), oracleTrusted }, 'observer: executable edge sampled');
       } catch (err) {
         logger.warn({ err, sizeBert: rawSize }, 'observer: executable quote sample failed');
       }
     }
+    if (cfg.paper.enabled) paper.updateQuotes(paperCandidates);
   };
   let observerTimer: NodeJS.Timeout | undefined;
   if (cfg.mode === 'observer') {
@@ -325,6 +372,7 @@ async function main(): Promise<void> {
     wdLoop.stop();
     fillLoop.shutdown();
     bookCache.shutdown();
+    publicTrades.shutdown();
     adverseFill.shutdown();
     process.exit(0);
   });

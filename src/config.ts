@@ -31,6 +31,14 @@ export const BotConfigSchema = z.object({
     sampleCadenceMs: z.number().int().min(5000).max(300_000).default(30_000),
   }).default({ sizesBert: [1000, 5000, 10000], maxBookAgeSec: 15, sampleCadenceMs: 30_000 }),
 
+  paper: z.object({
+    enabled: z.boolean().default(true),
+    minNetEdgeBps: z.number().nonnegative().default(40),
+    latencyPenaltyBps: z.number().nonnegative().default(20),
+    failedHedgeReserveBps: z.number().nonnegative().default(10),
+    transactionCostUsd: z.number().nonnegative().default(0.02),
+  }).default({ enabled: true, minNetEdgeBps: 40, latencyPenaltyBps: 20, failedHedgeReserveBps: 10, transactionCostUsd: 0.02 }),
+
   quoter: z.object({
     cadenceMs: z.number().int().min(500).max(60_000),
     bufferBps: z.number().nonnegative(),

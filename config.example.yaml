@@ -47,6 +47,15 @@ observer:
   maxBookAgeSec: 15
   sampleCadenceMs: 30000
 
+paper:
+  enabled: true
+  # Minimum snapshot edge required before simulating a resting order.
+  minNetEdgeBps: 40
+  # Conservative deductions applied after a qualifying public trade fill.
+  latencyPenaltyBps: 20
+  failedHedgeReserveBps: 10
+  transactionCostUsd: 0.02
+
 quoter:
   # Decision loop cadence (ms). Min 500, max 60_000.
   cadenceMs: 2500

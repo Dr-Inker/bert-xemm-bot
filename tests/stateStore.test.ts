@@ -47,6 +47,16 @@ describe('StateStore', () => {
     expect(rows[0]?.makerFeeBps).toBe(23);
   });
 
+  it('persists paper orders and friction-attributed fills', () => {
+    const t = '2026-07-26T00:00:00Z';
+    store.upsertPaperOrder({ paperOrderId:'po1', side:'buy', price:'0.01', sizeBert:'1000', queueAheadBert:'500', expectedEdgeBps:'50', placedAt:t, updatedAt:t });
+    store.cancelPaperOrder('po1', t, 'filled');
+    store.insertPaperFill({ paperFillId:'pf1', paperOrderId:'po1', krakenTradeId:1, side:'buy', fillPriceUsd:'0.01', volumeBert:'1000', dexHedgePriceUsd:'0.0102', grossPnlUsd:'0.2', makerFeeUsd:'0.023', transactionCostUsd:'0.02', latencyCostUsd:'0.0204', failureReserveUsd:'0.0102', netPnlUsd:'0.1264', dexImpactBps:'5', t });
+    const db = (store as unknown as { db: import('better-sqlite3').Database }).db;
+    expect((db.prepare('SELECT status FROM paper_orders WHERE paper_order_id=?').get('po1') as {status:string}).status).toBe('filled');
+    expect((db.prepare('SELECT net_pnl_usd FROM paper_fills WHERE paper_fill_id=?').get('pf1') as {net_pnl_usd:string}).net_pnl_usd).toBe('0.1264');
+  });
+
   it('withTransaction rolls back on throw', () => {
     expect(() => store.withTransaction(() => {
       store.insertOrder({
