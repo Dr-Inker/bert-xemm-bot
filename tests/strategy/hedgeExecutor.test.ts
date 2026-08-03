@@ -1,12 +1,33 @@
 import { describe, it, expect, vi } from 'vitest';
 import Decimal from 'decimal.js';
 import { HedgeExecutor } from '../../src/strategy/hedgeExecutor.js';
+import { StateStore } from '../../src/stateStore.js';
 
 const fill = {
   fillId: 'F1', orderClOrdId: 'cl-1', side: 'buy' as const,
   price: new Decimal('0.0177'), volume: new Decimal('1000'),
   fee: new Decimal('0.0044'), t: new Date('2026-05-20T00:00:00Z'),
 };
+
+const sellFillF9 = {
+  fillId: 'F9', orderClOrdId: 'cl-9', side: 'sell' as const,
+  price: new Decimal('0.0177'), volume: new Decimal('1000'),
+  fee: new Decimal('0.0044'), t: new Date('2026-05-20T00:00:00Z'),
+};
+
+// Same wiring main.ts uses: HedgeExecutor writes through to the real StateStore,
+// so the in-flight sum is exercised end to end.
+function realStore(): { store: StateStore; hedgeStore: ConstructorParameters<typeof HedgeExecutor>[0]['store'] } {
+  const store = new StateStore(':memory:');
+  return {
+    store,
+    hedgeStore: {
+      writeHedge: async (r) => { store.insertHedgeRow(r); },
+      readInFlight: async () => store.sumInFlightHedgesBert(),
+      markConfirmed: async (id, sig, slip) => { store.markHedgeConfirmed(id, sig, slip); },
+    },
+  };
+}
 
 describe('HedgeExecutor.onFill', () => {
   it('aborts when Jupiter priceImpact > maxDexSlippageBps', async () => {
@@ -123,6 +144,66 @@ describe('HedgeExecutor.onFill', () => {
     expect(store.writeHedge).toHaveBeenCalledWith(expect.objectContaining({
       status: 'intent_queued', bertNotional: '-1000',
     }));
+  });
+
+  it('estimateSwap throwing leaves a terminal row excluded from the in-flight sum', async () => {
+    const { store, hedgeStore } = realStore();
+    const dex = {
+      estimateSwap: vi.fn().mockRejectedValue(new Error('jupiter 502')),
+      submitSwap: vi.fn(),
+    };
+    const notifier = { page: vi.fn() };
+    const exec = new HedgeExecutor({
+      dex: dex as never, store: hedgeStore, notifier: notifier as never,
+      maxDexSlippageBps: 100, jitoTipLamports: 10_000,
+    });
+    // The 1000-BERT Kraken sell is real exposure; the failed hedge must not mask it.
+    await expect(exec.onFill(sellFillF9, new Decimal('86.12'))).rejects.toThrow('jupiter 502');
+    expect(store.sumInFlightHedgesBert().toString()).toBe('0');
+    expect(dex.submitSwap).not.toHaveBeenCalled();
+    expect(notifier.page).toHaveBeenCalledWith(expect.stringContaining('unhedged'));
+  });
+
+  it('submitSwap throwing leaves a terminal row excluded from the in-flight sum', async () => {
+    const { store, hedgeStore } = realStore();
+    const dex = {
+      estimateSwap: vi.fn().mockResolvedValue({
+        inputAsset: 'SOL', outputAsset: 'BERT', amountIn: new Decimal('0.2056'),
+        expectedAmountOut: new Decimal('1000'), slippageBps: 50, priceImpactBps: 10, routeJson: '{}',
+      }),
+      submitSwap: vi.fn().mockRejectedValue(new Error('blockhash expired')),
+    };
+    const notifier = { page: vi.fn() };
+    const exec = new HedgeExecutor({
+      dex: dex as never, store: hedgeStore, notifier: notifier as never,
+      maxDexSlippageBps: 100, jitoTipLamports: 10_000,
+    });
+    await expect(exec.onFill(sellFillF9, new Decimal('86.12'))).rejects.toThrow('blockhash expired');
+    expect(store.sumInFlightHedgesBert().toString()).toBe('0');
+    expect(notifier.page).toHaveBeenCalledWith(expect.stringContaining('unhedged'));
+  });
+
+  it('still counts a genuinely in-flight hedge, and drops it once confirmed', async () => {
+    const { store, hedgeStore } = realStore();
+    let sumMidFlight = '';
+    const dex = {
+      estimateSwap: vi.fn().mockResolvedValue({
+        inputAsset: 'SOL', outputAsset: 'BERT', amountIn: new Decimal('0.2056'),
+        expectedAmountOut: new Decimal('1000'), slippageBps: 50, priceImpactBps: 10, routeJson: '{}',
+      }),
+      // Sampled while the row sits at swap_quoted — the hedge really is in flight here.
+      submitSwap: vi.fn(() => {
+        sumMidFlight = store.sumInFlightHedgesBert().toString();
+        return Promise.resolve('SIG-INFLIGHT');
+      }),
+    };
+    const exec = new HedgeExecutor({
+      dex: dex as never, store: hedgeStore, notifier: { page: vi.fn() } as never,
+      maxDexSlippageBps: 100, jitoTipLamports: 10_000,
+    });
+    await exec.onFill(sellFillF9, new Decimal('86.12'));
+    expect(sumMidFlight).toBe('-1000');
+    expect(store.sumInFlightHedgesBert().toString()).toBe('0');
   });
 
   it('happy path: poll returns confirmed → markConfirmed called', async () => {

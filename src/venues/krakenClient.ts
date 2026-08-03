@@ -13,6 +13,13 @@ import { logger } from '../logger.js';
 export const FEE_TIER_FALLBACK_MAKER_BPS = 25;
 export const FEE_TIER_FALLBACK_TAKER_BPS = 40;
 
+/** Kraken reports fees as percent strings. Returns null for anything not finite and >= 0. */
+function parseFeePct(raw: string | undefined): number | null {
+  if (raw === undefined) return null;
+  const v = parseFloat(raw);
+  return Number.isFinite(v) && v >= 0 ? v : null;
+}
+
 export interface KrakenClientConfig {
   cliBinaryPath: string;
   pair: string;
@@ -168,18 +175,20 @@ export class KrakenClient implements HedgeVenue {
     const j = await this.runJson<{ fees?: Record<string, { fee_maker?: string; fee?: string }> }>(['volume', '--pair', this.cfg.pair]);
     const k = this.cfg.pair;
     const entry = j.fees?.[k];
-    if (!entry || entry.fee_maker === undefined || entry.fee === undefined) {
+    // Only a finite, non-negative percentage is usable. NaN in particular must never escape:
+    // every comparison against it is false, so a NaN fee reads as "costs nothing" downstream
+    // in the edge check and would wave through quotes that are actually unprofitable.
+    const maker = parseFeePct(entry?.fee_maker);
+    const taker = parseFeePct(entry?.fee);
+    if (maker === null || taker === null) {
       // Fail conservative: an unknown fee tier must never make quoting look cheaper
       // than reality, so assume the worst public tier rather than our current one.
       logger.warn(
-        { pair: k, availableKeys: Object.keys(j.fees ?? {}) },
-        'kraken volume response missing fee tier for pair; using conservative fallback (25/40 bps)',
+        { pair: k, availableKeys: Object.keys(j.fees ?? {}), rawMaker: entry?.fee_maker, rawTaker: entry?.fee },
+        'kraken volume response missing or unusable fee tier for pair; using conservative fallback (25/40 bps)',
       );
       return { makerBps: FEE_TIER_FALLBACK_MAKER_BPS, takerBps: FEE_TIER_FALLBACK_TAKER_BPS };
     }
-    return {
-      makerBps: Math.round(parseFloat(entry.fee_maker) * 100),
-      takerBps: Math.round(parseFloat(entry.fee) * 100),
-    };
+    return { makerBps: Math.round(maker * 100), takerBps: Math.round(taker * 100) };
   }
 }

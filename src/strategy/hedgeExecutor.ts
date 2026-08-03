@@ -75,58 +75,79 @@ export class HedgeExecutor {
     let lastQuote: SwapQuote | null = null;
     let lastSig: string | null = null;
 
-    while (attempt <= maxRetries) {
-      const quote = await this.opts.dex.estimateSwap(dir.input, dir.output, amountIn);
-      lastQuote = quote;
+    // Everything below runs against a row that sumInFlightHedgesBert() counts as in-flight,
+    // i.e. as good as settled. If any step throws, that row would sit non-terminal forever
+    // and the tracker would report a flat book while the Kraken leg is genuinely unhedged —
+    // so the catch drives the row to a terminal status before rethrowing.
+    try {
+      while (attempt <= maxRetries) {
+        const quote = await this.opts.dex.estimateSwap(dir.input, dir.output, amountIn);
+        lastQuote = quote;
 
-      await this.opts.store.writeHedge({
-        hedgeId, triggeringFillId: fill.fillId, status: 'swap_quoted',
-        jupiterQuote: quote.routeJson, txSig: null, slippageRealized: null,
-        bertNotional, tIntent, tConfirmed: null,
-      });
-
-      if (quote.priceImpactBps > this.opts.maxDexSlippageBps) {
         await this.opts.store.writeHedge({
-          hedgeId, triggeringFillId: fill.fillId, status: 'slippage_aborted',
-          jupiterQuote: quote.routeJson, txSig: null,
-          slippageRealized: String(quote.priceImpactBps),
+          hedgeId, triggeringFillId: fill.fillId, status: 'swap_quoted',
+          jupiterQuote: quote.routeJson, txSig: null, slippageRealized: null,
           bertNotional, tIntent, tConfirmed: null,
         });
-        this.opts.notifier.page(`hedge ${hedgeId} aborted: priceImpact ${quote.priceImpactBps}bps > ${this.opts.maxDexSlippageBps}bps`);
-        return;
+
+        if (quote.priceImpactBps > this.opts.maxDexSlippageBps) {
+          await this.opts.store.writeHedge({
+            hedgeId, triggeringFillId: fill.fillId, status: 'slippage_aborted',
+            jupiterQuote: quote.routeJson, txSig: null,
+            slippageRealized: String(quote.priceImpactBps),
+            bertNotional, tIntent, tConfirmed: null,
+          });
+          this.opts.notifier.page(`hedge ${hedgeId} aborted: priceImpact ${quote.priceImpactBps}bps > ${this.opts.maxDexSlippageBps}bps`);
+          return;
+        }
+
+        const sig = await this.opts.dex.submitSwap(quote, { jito: true, tipLamports: this.opts.jitoTipLamports });
+        lastSig = sig;
+        await this.opts.store.writeHedge({
+          hedgeId, triggeringFillId: fill.fillId, status: 'tx_submitted',
+          jupiterQuote: quote.routeJson, txSig: sig, slippageRealized: null,
+          bertNotional, tIntent, tConfirmed: null,
+        });
+
+        // Poll confirmation.
+        const status = await this.pollUntilTerminal(sig);
+        if (status === 'confirmed') {
+          await this.opts.store.markConfirmed(hedgeId, sig, String(quote.priceImpactBps));
+          return;
+        }
+
+        // failed or pending-past-timeout → mark for retry
+        attempt += 1;
+        if (attempt > maxRetries) break;
+        await this.opts.store.writeHedge({
+          hedgeId, triggeringFillId: fill.fillId, status: 'failed_will_retry',
+          jupiterQuote: quote.routeJson, txSig: sig, slippageRealized: null,
+          bertNotional, tIntent, tConfirmed: null,
+        });
       }
 
-      const sig = await this.opts.dex.submitSwap(quote, { jito: true, tipLamports: this.opts.jitoTipLamports });
-      lastSig = sig;
       await this.opts.store.writeHedge({
-        hedgeId, triggeringFillId: fill.fillId, status: 'tx_submitted',
-        jupiterQuote: quote.routeJson, txSig: sig, slippageRealized: null,
+        hedgeId, triggeringFillId: fill.fillId, status: 'failed_dead_letter',
+        jupiterQuote: lastQuote?.routeJson ?? null, txSig: lastSig, slippageRealized: null,
         bertNotional, tIntent, tConfirmed: null,
       });
-
-      // Poll confirmation.
-      const status = await this.pollUntilTerminal(sig);
-      if (status === 'confirmed') {
-        await this.opts.store.markConfirmed(hedgeId, sig, String(quote.priceImpactBps));
-        return;
-      }
-
-      // failed or pending-past-timeout → mark for retry
-      attempt += 1;
-      if (attempt > maxRetries) break;
-      await this.opts.store.writeHedge({
-        hedgeId, triggeringFillId: fill.fillId, status: 'failed_will_retry',
-        jupiterQuote: quote.routeJson, txSig: sig, slippageRealized: null,
-        bertNotional, tIntent, tConfirmed: null,
-      });
+      this.opts.notifier.page(`hedge ${hedgeId} dead-lettered after ${maxRetries} retries; lastSig=${lastSig ?? 'n/a'}`);
+    } catch (err) {
+      // Best-effort: if the store itself is what failed, the page below is the last defense.
+      try {
+        await this.opts.store.writeHedge({
+          hedgeId, triggeringFillId: fill.fillId, status: 'failed_dead_letter',
+          jupiterQuote: lastQuote?.routeJson ?? null, txSig: lastSig, slippageRealized: null,
+          bertNotional, tIntent, tConfirmed: null,
+        });
+      } catch { /* store unreachable; fall through to the page */ }
+      this.opts.notifier.page(
+        `hedge ${hedgeId} failed before confirmation (${err instanceof Error ? err.message : String(err)}); ` +
+        `unhedged ${bertNotional} BERT from fill ${fill.fillId}` +
+        (lastSig ? ` — tx ${lastSig} may still land, verify` : ''),
+      );
+      throw err;
     }
-
-    await this.opts.store.writeHedge({
-      hedgeId, triggeringFillId: fill.fillId, status: 'failed_dead_letter',
-      jupiterQuote: lastQuote?.routeJson ?? null, txSig: lastSig, slippageRealized: null,
-      bertNotional, tIntent, tConfirmed: null,
-    });
-    this.opts.notifier.page(`hedge ${hedgeId} dead-lettered after ${maxRetries} retries; lastSig=${lastSig ?? 'n/a'}`);
   }
 
   private async pollUntilTerminal(sig: string): Promise<'confirmed'|'failed'> {

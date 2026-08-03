@@ -229,6 +229,7 @@ async function main(): Promise<void> {
       warn: (m) => { void notifier.warn(m); },
     },
     evaluate: evaluateConditions,
+    logger,
   });
 
   const quoter = new QuoterLoop({

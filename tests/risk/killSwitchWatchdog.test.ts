@@ -59,6 +59,54 @@ describe('KillSwitchWatchdog fail-closed integration', () => {
     expect(notifier.page).toHaveBeenCalledWith(expect.stringContaining('watchdog_evaluate_error'));
   });
 
+  it('cancelAll rejecting still latches degraded, persists the kill event and pages', async () => {
+    const { store, cex, notifier, watchdog } = harness(
+      failClosedEvaluate(async () => { throw new Error('evaluate exploded'); }, vi.fn()),
+    );
+    cex.cancelAll.mockRejectedValue(new Error('kraken cancelAll 500'));
+    const tripped = await watchdog.tick();
+    expect(tripped).toHaveLength(1);
+    expect(store.setFlag).toHaveBeenCalledWith('degraded', '1');
+    expect(store.insertKillEvent).toHaveBeenCalledWith(expect.objectContaining({
+      actionTaken: 'cancel_all_refuse_resume',
+    }));
+    expect(notifier.page).toHaveBeenCalledWith(expect.stringContaining('watchdog_evaluate_error'));
+    expect(cex.cancelAll).toHaveBeenCalledTimes(1);
+  });
+
+  it('latches degraded and persists the kill event before cancelAll is attempted', async () => {
+    const order: string[] = [];
+    const { store, cex, watchdog } = harness(
+      failClosedEvaluate(async () => { throw new Error('boom'); }, vi.fn()),
+    );
+    store.setFlag.mockImplementation(() => { order.push('degraded'); });
+    store.insertKillEvent.mockImplementation(() => { order.push('event'); });
+    cex.cancelAll.mockImplementation(() => { order.push('cancel'); return Promise.resolve({ cancelled: 0 }); });
+    await watchdog.tick();
+    expect(order).toEqual(['degraded', 'event', 'cancel']);
+  });
+
+  it('a failing store does not prevent the page or the cancelAll', async () => {
+    const { store, cex, notifier, watchdog } = harness(
+      failClosedEvaluate(async () => { throw new Error('boom'); }, vi.fn()),
+    );
+    store.setFlag.mockImplementation(() => { throw new Error('sqlite disk I/O error'); });
+    store.insertKillEvent.mockImplementation(() => { throw new Error('sqlite disk I/O error'); });
+    const tripped = await watchdog.tick();
+    expect(tripped).toHaveLength(1);
+    expect(notifier.page).toHaveBeenCalled();
+    expect(cex.cancelAll).toHaveBeenCalledTimes(1);
+  });
+
+  it('a throwing notifier does not prevent the cancelAll', async () => {
+    const { cex, notifier, watchdog } = harness(
+      failClosedEvaluate(async () => { throw new Error('boom'); }, vi.fn()),
+    );
+    notifier.page.mockImplementation(() => { throw new Error('discord webhook down'); });
+    await expect(watchdog.tick()).resolves.toHaveLength(1);
+    expect(cex.cancelAll).toHaveBeenCalledTimes(1);
+  });
+
   it('a clean evaluate body does not trip the watchdog', async () => {
     const { cex, store, watchdog } = harness(
       failClosedEvaluate(async (out) => {

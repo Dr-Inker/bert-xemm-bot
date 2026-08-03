@@ -42,6 +42,31 @@ describe('KrakenClient queries', () => {
     warn.mockRestore();
   });
 
+  it('feeTier falls back to conservative bps when the reported fee is unparseable', async () => {
+    vi.spyOn(exec, 'execFileNoThrow').mockResolvedValue({
+      stdout: JSON.stringify({ fees: { BERTUSD: { fee_maker: 'garbage', fee: '0.26' } } }), stderr: '', status: 0,
+    });
+    const warn = vi.spyOn(logger, 'warn').mockImplementation((() => undefined) as never);
+    const c = new KrakenClient(cfg);
+    const t = await c.feeTier();
+    expect(t.makerBps).toBe(25);
+    expect(t.takerBps).toBe(40);
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it('feeTier falls back to conservative bps when a reported fee is negative', async () => {
+    vi.spyOn(exec, 'execFileNoThrow').mockResolvedValue({
+      stdout: JSON.stringify({ fees: { BERTUSD: { fee_maker: '-0.01', fee: '0.26' } } }), stderr: '', status: 0,
+    });
+    const warn = vi.spyOn(logger, 'warn').mockImplementation((() => undefined) as never);
+    const c = new KrakenClient(cfg);
+    const t = await c.feeTier();
+    expect(t.makerBps).toBe(25);
+    expect(t.takerBps).toBe(40);
+    warn.mockRestore();
+  });
+
   it('openOrders parses array correctly', async () => {
     vi.spyOn(exec, 'execFileNoThrow').mockResolvedValue({
       stdout: JSON.stringify({
