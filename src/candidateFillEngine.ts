@@ -17,6 +17,8 @@ export interface CandidateLadderRung {
 
 export interface CandidateOrder {
   candidateOrderId: string;
+  economicFingerprint: string;
+  operationalFingerprint: string;
   rungIndex: number;
   side: Side;
   distanceBps: string;
@@ -37,6 +39,8 @@ export interface CandidateOrder {
 
 export interface CandidateFillRecord {
   candidateFillId: string;
+  economicFingerprint: string;
+  operationalFingerprint: string;
   candidateOrderId: string;
   krakenTradeId: number;
   hedgeBatchId: string;
@@ -73,6 +77,8 @@ export interface CandidateHedgeResult {
 export interface CandidatePendingFill {
   candidateFillId: string;
   candidateOrderId: string;
+  economicFingerprint: string;
+  operationalFingerprint: string;
   krakenTradeId: number;
   hedgeBatchId: string;
   side: Side;
@@ -86,6 +92,8 @@ export interface CandidatePendingFill {
 }
 
 export interface CandidateFillEngineOpts {
+  economicFingerprint: string;
+  operationalFingerprint: string;
   ladder: CandidateLadderRung[];
   minAllInEdgeBps: number;
   repriceThresholdBps: number;
@@ -111,7 +119,7 @@ export interface CandidateFillEngineOpts {
 }
 
 type AllocationOrder = Pick<CandidateOrder,
-  'candidateOrderId' | 'side' | 'distanceBps' | 'price' | 'referencePriceUsd' | 'referenceImpactBps'>;
+  'candidateOrderId' | 'economicFingerprint' | 'operationalFingerprint' | 'side' | 'distanceBps' | 'price' | 'referencePriceUsd' | 'referenceImpactBps'>;
 
 interface Allocation {
   fillId: string;
@@ -179,6 +187,7 @@ export class CandidateFillEngine {
   private history: HistoryEntry[] = [];
   private lastSnapshotAtMs: number | null = null;
   private refreshFailed = false;
+  private externalGates = new Map<string, string>();
   private orderSeq = 0;
   private batchSeq = 0;
   private fillSeq = 0;
@@ -191,6 +200,11 @@ export class CandidateFillEngine {
 
   recordRefreshFailure(): void { this.refreshFailed = true; }
   recordRefreshSuccess(): void { this.refreshFailed = false; }
+
+  /** Runtime/provider gates are incorporated into the same auditable lifecycle. */
+  setExternalGates(gates: Array<{ gate: string; detailJson: string }>): void {
+    this.externalGates = new Map(gates.map(gate => [gate.gate, gate.detailJson]));
+  }
 
   activeOrders(): CandidateOrder[] { return [...this.orders.values()].map(order => ({ ...order })); }
   hasPendingHedge(): boolean { return this.pendingHedges.length > 0; }
@@ -216,6 +230,8 @@ export class CandidateFillEngine {
         fillId: fill.candidateFillId,
         order: {
           candidateOrderId: fill.candidateOrderId,
+          economicFingerprint: fill.economicFingerprint,
+          operationalFingerprint: fill.operationalFingerprint,
           side: fill.side,
           distanceBps: fill.distanceBps,
           price: fill.fillPriceUsd,
@@ -414,6 +430,8 @@ export class CandidateFillEngine {
     const queue = queueAhead(snapshot.book, side, price);
     const order: CandidateOrder = {
       candidateOrderId: `candidate-${side}-${rungIndex}-${now.getTime()}-${++this.orderSeq}`,
+      economicFingerprint: this.opts.economicFingerprint,
+      operationalFingerprint: this.opts.operationalFingerprint,
       rungIndex,
       side,
       distanceBps: new Decimal(rung.distanceBps).toString(),
@@ -456,6 +474,8 @@ export class CandidateFillEngine {
       const stress = realizedEconomics(allocation.order.side, fillPrice, allocation.volume, dexPrice, this.opts.stressFriction, txShare);
       this.opts.store.upsertCandidateFill({
         candidateFillId: allocation.fillId,
+        economicFingerprint: allocation.order.economicFingerprint,
+        operationalFingerprint: allocation.order.operationalFingerprint,
         candidateOrderId: allocation.order.candidateOrderId,
         krakenTradeId: allocation.trade.tradeId,
         hedgeBatchId: batchId,
@@ -489,6 +509,8 @@ export class CandidateFillEngine {
   }
 
   private globalCloseReason(snapshot: CandidateEconomicSnapshot | null, now: Date): string | null {
+    const externalGate = this.externalGates.keys().next().value as string | undefined;
+    if (externalGate) return externalGate;
     if (!snapshot || now.getTime() - snapshot.asOf.getTime() > this.opts.maxQuoteAgeMs) return 'ttl_stale';
     if (this.pendingHedges.length > 0) return 'hedge_pending';
     if (now.getTime() - snapshot.book.t.getTime() > this.opts.maxBookAgeSec * 1000) return 'gate_untrusted';
@@ -497,7 +519,8 @@ export class CandidateFillEngine {
   }
 
   private currentGates(snapshot: CandidateEconomicSnapshot | null, now: Date): Array<{ gate: string; detailJson: string }> {
-    const gates: Array<{ gate: string; detailJson: string }> = [];
+    const gates: Array<{ gate: string; detailJson: string }> = [...this.externalGates]
+      .map(([gate, detailJson]) => ({ gate, detailJson }));
     if (!snapshot || now.getTime() - snapshot.asOf.getTime() > this.opts.maxQuoteAgeMs) {
       gates.push({ gate: 'ttl_stale', detailJson: JSON.stringify({ maxAgeMs: this.opts.maxQuoteAgeMs }) });
     }

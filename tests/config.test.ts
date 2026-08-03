@@ -63,6 +63,13 @@ describe('config', () => {
     expect(cfg.quoter.cadenceMs).toBe(2500);
     expect(cfg.watchdog.conditions.netDeltaUsd).toBe(500);
     expect(cfg.candidate.enabled).toBe(false);
+    expect(cfg.candidate.jupiterBaseUrl).toBe('https://api.jup.ag/swap/v1');
+    expect(cfg.candidate.apiKeyEnv).toBe('JUPITER_API_KEY');
+    expect(cfg.candidate.maxQuoteCallsPerSec).toBe(6);
+    expect(cfg.candidate.disableOnProviderRateLimit).toBe(true);
+    expect(cfg.candidate.providerRateLimitConsecutiveThreshold).toBe(3);
+    expect(cfg.candidate.providerRateLimitDefaultCooldownMs).toBe(60_000);
+    expect(cfg.candidate.baselineWatchdogMs).toBe(45_000);
     expect(cfg.candidate.ladder).toEqual([
       { sizeBert: 1000, distanceBps: 175 },
       { sizeBert: 500, distanceBps: 400 },

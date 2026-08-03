@@ -30,6 +30,8 @@ function harness(overrides: Partial<CandidateFillEngineOpts> = {}) {
     syncCandidateGatePeriods: vi.fn(),
   };
   const opts: CandidateFillEngineOpts = {
+    economicFingerprint: 'test-economic-fingerprint',
+    operationalFingerprint: 'test-operational-fingerprint',
     ladder: [{ sizeBert: 100, distanceBps: 175 }, { sizeBert: 100, distanceBps: 400 }],
     minAllInEdgeBps: 75,
     repriceThresholdBps: 10,
@@ -117,6 +119,29 @@ describe('CandidateFillEngine', () => {
     expect(store.closeCandidateOrder).toHaveBeenCalledWith(expect.any(String), expect.any(String), expect.any(String), 'ttl_stale');
   });
 
+  it('pulls quotes and persists an external provider-rate-limit gate until cleared', () => {
+    const { engine, store } = harness({ ladder: [{ sizeBert: 100, distanceBps: 400 }], maxActivePerSideBert: 100 });
+    const first = snapshot('2026-08-03T00:00:00.000Z');
+    engine.updateQuotes(first, first.asOf);
+    expect(engine.activeOrders()).toHaveLength(2);
+
+    engine.setExternalGates([{
+      gate: 'provider_rate_limited',
+      detailJson: '{"consecutive429s":1}',
+    }]);
+    engine.updateQuotes(first, new Date('2026-08-03T00:00:00.100Z'));
+    expect(engine.activeOrders()).toHaveLength(0);
+    expect(store.closeCandidateOrder.mock.calls.slice(-2).every(call => call[3] === 'provider_rate_limited')).toBe(true);
+    expect(store.syncCandidateGatePeriods.mock.calls.at(-1)?.[0]).toContainEqual({
+      gate: 'provider_rate_limited', detailJson: '{"consecutive429s":1}',
+    });
+
+    engine.setExternalGates([]);
+    const fresh = snapshot('2026-08-03T00:00:01.000Z');
+    engine.updateQuotes(fresh, fresh.asOf);
+    expect(engine.activeOrders()).toHaveLength(2);
+  });
+
   it('resumes after drift metrics stay below both thresholds for 30s despite normal adverse ticks', () => {
     const { engine, store } = harness({ ladder: [{ sizeBert: 100, distanceBps: 400 }], maxActivePerSideBert: 100 });
     const initial = snapshot('2026-08-03T00:00:00.000Z');
@@ -200,6 +225,8 @@ describe('CandidateFillEngine', () => {
     const now = new Date('2026-08-03T00:03:00.001Z');
     engine.restorePendingFills([{
       candidateFillId: 'cf-old', candidateOrderId: 'co-old', krakenTradeId: 31,
+      economicFingerprint: 'test-economic-fingerprint',
+      operationalFingerprint: 'test-operational-fingerprint',
       hedgeBatchId: 'ch-old', side: 'buy', distanceBps: '400', fillPriceUsd: '0.096',
       volumeBert: '50', orderRemainingBert: '50', referencePriceUsd: '0.1',
       referenceImpactBps: '2', t: '2026-08-03T00:00:00.000Z',
@@ -215,6 +242,8 @@ describe('CandidateFillEngine', () => {
     const recoveryNow = new Date('2026-08-03T00:01:00.000Z');
     recovered.engine.restorePendingFills([{
       candidateFillId: 'cf-recent', candidateOrderId: 'co-recent', krakenTradeId: 32,
+      economicFingerprint: 'test-economic-fingerprint',
+      operationalFingerprint: 'test-operational-fingerprint',
       hedgeBatchId: 'ch-recent', side: 'buy', distanceBps: '400', fillPriceUsd: '0.096',
       volumeBert: '50', orderRemainingBert: '50', referencePriceUsd: '0.1',
       referenceImpactBps: '2', t: '2026-08-03T00:00:30.000Z',

@@ -1,6 +1,7 @@
 import Database from 'better-sqlite3';
 import { mkdir, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
+import { sanitizeCandidateDashboardIdentity } from './candidateRuntime.js';
 
 interface RawSample {
   t: string; size_bert: string; raydium_mid_usd: string; kraken_bid: string; kraken_ask: string;
@@ -22,6 +23,14 @@ interface RawCandidateFill {
 }
 interface RawGatePeriod { gate: string; started_at: string; ended_at: string | null }
 interface RawCloseReason { close_reason: string; n: number }
+interface RawCandidateRuntime {
+  economic_fingerprint: string; operational_fingerprint: string;
+  activated_at: string; latched_at: string | null; latch_reason: string | null;
+}
+interface RawCandidateAttempt {
+  duration_ms: number; provider_status: string; rate_limit_429_count: number;
+  baseline_sample_age_ms: number; attempt_kind: string;
+}
 
 const dbPath = process.env['BERT_XEMM_DB'] ?? '/var/lib/bert-xemm-bot/state.db';
 const outputPath = process.env['BERT_XEMM_DASHBOARD_JSON'] ?? '/var/www/drinkerlabs/bert-mm/data.json';
@@ -34,18 +43,32 @@ const paperRows = db.prepare(`SELECT paper_fill_id,side,volume_bert,gross_pnl_us
   transaction_cost_usd,latency_cost_usd,failure_reserve_usd,net_pnl_usd,t
   FROM paper_fills WHERE t >= ? ORDER BY t ASC`).all(since) as RawPaperFill[];
 const openPaperOrders = (db.prepare(`SELECT COUNT(*) n FROM paper_orders WHERE status='open'`).get() as { n: number }).n;
+const candidateRuntime = db.prepare(`SELECT economic_fingerprint,operational_fingerprint,
+  activated_at,latched_at,latch_reason
+  FROM candidate_runtime_state WHERE singleton=1`).get() as RawCandidateRuntime | undefined;
+const currentEconomicFingerprint = candidateRuntime?.economic_fingerprint ?? null;
+const currentOperationalFingerprint = candidateRuntime?.operational_fingerprint ?? null;
 const candidateRows = db.prepare(`SELECT candidate_fill_id,side,distance_bps,volume_bert,gross_pnl_usd,
   normal_net_pnl_usd,stress_net_pnl_usd,hedge_status,economics_source,
   hedge_resolved_at,hedge_terminal_reason,t
-  FROM candidate_fills WHERE t >= ? ORDER BY t ASC`).all(since) as RawCandidateFill[];
-const openCandidateOrders = (db.prepare(`SELECT COUNT(*) n FROM candidate_orders WHERE status='open'`).get() as { n: number }).n;
+  FROM candidate_fills WHERE t >= ? AND economic_fingerprint = ? ORDER BY t ASC`)
+  .all(since, currentEconomicFingerprint ?? '') as RawCandidateFill[];
+const openCandidateOrders = (db.prepare(`SELECT COUNT(*) n FROM candidate_orders
+  WHERE status='open' AND economic_fingerprint = ?`).get(currentEconomicFingerprint ?? '') as { n: number }).n;
 const publicTrades24h = (db.prepare(`SELECT COUNT(*) n FROM public_trades WHERE t >= ?`).get(since) as { n: number }).n;
-const candidateSnapshots24h = (db.prepare(`SELECT COUNT(DISTINCT t) n FROM candidate_snapshots WHERE t >= ?`).get(since) as { n: number }).n;
-const latestCandidateSnapshot = (db.prepare(`SELECT MAX(t) t FROM candidate_snapshots`).get() as { t: string | null }).t;
+const candidateSnapshots24h = (db.prepare(`SELECT COUNT(DISTINCT t) n FROM candidate_snapshots
+  WHERE t >= ? AND economic_fingerprint = ?`).get(since, currentEconomicFingerprint ?? '') as { n: number }).n;
+const latestCandidateSnapshot = (db.prepare(`SELECT MAX(t) t FROM candidate_snapshots
+  WHERE economic_fingerprint = ?`).get(currentEconomicFingerprint ?? '') as { t: string | null }).t;
+const candidateAttempts = db.prepare(`SELECT duration_ms,provider_status,rate_limit_429_count,
+  baseline_sample_age_ms,attempt_kind FROM candidate_quote_attempts
+  WHERE started_at >= ? AND economic_fingerprint = ? ORDER BY started_at ASC`)
+  .all(since, currentEconomicFingerprint ?? '') as RawCandidateAttempt[];
 const gateRows = db.prepare(`SELECT gate,started_at,ended_at FROM candidate_gate_periods
   WHERE ended_at IS NULL OR ended_at >= ? OR started_at >= ? ORDER BY started_at ASC`).all(since, since) as RawGatePeriod[];
 const closeReasons = db.prepare(`SELECT close_reason,COUNT(*) n FROM candidate_orders
-  WHERE updated_at >= ? AND close_reason IS NOT NULL GROUP BY close_reason ORDER BY close_reason`).all(since) as RawCloseReason[];
+  WHERE updated_at >= ? AND economic_fingerprint = ? AND close_reason IS NOT NULL
+  GROUP BY close_reason ORDER BY close_reason`).all(since, currentEconomicFingerprint ?? '') as RawCloseReason[];
 db.close();
 
 const samples = rows.map(r => ({
@@ -100,6 +123,9 @@ const eligibleCandidateFills = simulatedCandidateFills.filter(fill => fill.econo
 const candidateSum = (key: 'grossPnlUsd' | 'normalNetPnlUsd' | 'stressNetPnlUsd'): number =>
   eligibleCandidateFills.reduce((total, fill) => total + fill[key], 0);
 const candidateDrawdowns = dualDrawdown(eligibleCandidateFills);
+const successfulSnapshotDurations = candidateAttempts
+  .filter(attempt => attempt.attempt_kind === 'snapshot' && attempt.provider_status === 'success')
+  .map(attempt => attempt.duration_ms);
 const nowMs = Date.now();
 const gateSummary = [...new Set(gateRows.map(row => row.gate))].sort().map(gate => {
   const periods = gateRows.filter(row => row.gate === gate);
@@ -133,6 +159,13 @@ const payload = {
     maxDrawdownUsd24h: maxDrawdownUsd, recentFills: paperFills.slice(-20).reverse(),
   },
   candidate: {
+    ...sanitizeCandidateDashboardIdentity({
+      economicFingerprint: currentEconomicFingerprint,
+      operationalFingerprint: currentOperationalFingerprint,
+      activatedAt: candidateRuntime?.activated_at ?? null,
+      latchedAt: candidateRuntime?.latched_at ?? null,
+      latchReason: candidateRuntime?.latch_reason ?? null,
+    }),
     latestSnapshotT: latestCandidateSnapshot,
     snapshots24h: candidateSnapshots24h,
     publicTrades24h,
@@ -143,6 +176,14 @@ const payload = {
     restartRecoveredFills24h: simulatedCandidateFills.filter(fill => fill.economicsSource === 'restart_recovered_executable').length,
     pendingFills24h: candidateFills.filter(fill => fill.hedgeStatus === 'pending').length,
     abandonedFills24h: candidateFills.filter(fill => fill.hedgeStatus === 'abandoned').length,
+    quoteAttempts24h: candidateAttempts.length,
+    provider429s24h: candidateAttempts.reduce((total, attempt) => total + attempt.rate_limit_429_count, 0),
+    capacitySkippedSnapshots24h: candidateAttempts.filter(attempt =>
+      attempt.attempt_kind === 'snapshot' && attempt.provider_status === 'capacity_skipped').length,
+    snapshotConstructionP99Ms24h: percentile(successfulSnapshotDurations, 0.99),
+    maxBaselineSampleAgeMs24h: candidateAttempts.length
+      ? Math.max(...candidateAttempts.map(attempt => attempt.baseline_sample_age_ms))
+      : null,
     grossPnlUsd24h: candidateSum('grossPnlUsd'),
     normalNetPnlUsd24h: candidateSum('normalNetPnlUsd'),
     stressNetPnlUsd24h: candidateSum('stressNetPnlUsd'),
@@ -167,6 +208,11 @@ function median(xs: number[]): number | null {
   const ys = [...xs].sort((a, b) => a - b);
   const m = Math.floor(ys.length / 2);
   return ys.length % 2 ? ys[m]! : (ys[m - 1]! + ys[m]!) / 2;
+}
+function percentile(xs: number[], quantile: number): number | null {
+  if (!xs.length) return null;
+  const ys = [...xs].sort((a, b) => a - b);
+  return ys[Math.max(0, Math.ceil(quantile * ys.length) - 1)] ?? null;
 }
 function dualDrawdown(fills: Array<{ normalNetPnlUsd: number; stressNetPnlUsd: number }>): { normal: number; stress: number } {
   let normalEquity = 0, normalPeak = 0, normal = 0;

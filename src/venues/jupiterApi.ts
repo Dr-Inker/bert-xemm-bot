@@ -12,9 +12,20 @@ export const DECIMALS: Record<keyof typeof MINT, number> = { BERT: 6, SOL: 9, US
 export const JUPITER_QUOTE_TIMEOUT_MS = 10_000;
 export const JUPITER_SWAP_TIMEOUT_MS = 10_000;
 
-export interface QuoteArgs { inputMint: string; outputMint: string; amount: string; slippageBps: number; baseUrl: string; timeoutMs?: number; swapMode?: 'ExactIn' | 'ExactOut' }
+export interface QuoteArgs { inputMint: string; outputMint: string; amount: string; slippageBps: number; baseUrl: string; timeoutMs?: number; swapMode?: 'ExactIn' | 'ExactOut'; apiKey?: string }
 export interface QuoteResp { inAmount?: string; outAmount: string; otherAmountThreshold: string; slippageBps: number; routePlan: unknown[]; priceImpactPct: string; contextSlot: number; timeTaken: number }
 export interface BuildSwapResp { swapTransaction: string }
+
+/** Structured HTTP failure used by the candidate lane's provider circuit breaker. */
+export class JupiterQuoteHttpError extends Error {
+  constructor(
+    readonly status: number,
+    readonly rateLimitResetAtMs: number | null,
+  ) {
+    super(`jupiter quote HTTP ${status}`);
+    this.name = 'JupiterQuoteHttpError';
+  }
+}
 
 export async function jupiterQuote(a: QuoteArgs): Promise<QuoteResp> {
   const url = new URL(`${a.baseUrl}/quote`);
@@ -23,10 +34,21 @@ export async function jupiterQuote(a: QuoteArgs): Promise<QuoteResp> {
   url.searchParams.set('amount', a.amount);
   url.searchParams.set('slippageBps', String(a.slippageBps));
   if (a.swapMode) url.searchParams.set('swapMode', a.swapMode);
-  const r = await fetch(url.toString(), {
+  const request: RequestInit = {
     signal: AbortSignal.timeout(a.timeoutMs ?? JUPITER_QUOTE_TIMEOUT_MS),
-  });
-  if (!r.ok) throw new Error(`jupiter quote ${r.status}: ${await r.text()}`);
+  };
+  if (a.apiKey) request.headers = { 'x-api-key': a.apiKey };
+  const r = await fetch(url.toString(), request);
+  if (!r.ok) {
+    // Do not include the request URL, headers, or response body in the error: the
+    // candidate API key must never be reflected through a loggable exception.
+    const reset = r.headers?.get('x-ratelimit-reset');
+    const resetSeconds = reset === null || reset === undefined ? NaN : Number(reset);
+    throw new JupiterQuoteHttpError(
+      r.status,
+      Number.isFinite(resetSeconds) ? resetSeconds * 1000 : null,
+    );
+  }
   return r.json() as Promise<QuoteResp>;
 }
 

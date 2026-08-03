@@ -33,6 +33,20 @@ export interface ObserverSampleRow {
   bookAgeMs: number; oracleTrusted: boolean;
 }
 
+export interface CandidateQuoteAttemptRow {
+  attemptKind: 'snapshot' | 'hedge';
+  startedAt: string;
+  completedAt: string;
+  durationMs: number;
+  requestedCallCount: number;
+  providerStatus: 'success' | 'error' | 'http_429' | 'capacity_skipped';
+  httpStatus: number | null;
+  rateLimit429Count: number;
+  baselineSampleAgeMs: number;
+  economicFingerprint: string;
+  operationalFingerprint: string;
+}
+
 export class StateStore {
   private db: DB;
   constructor(path: string) {
@@ -118,6 +132,9 @@ export class StateStore {
       CREATE INDEX IF NOT EXISTS idx_public_trades_t ON public_trades(t);
       CREATE TABLE IF NOT EXISTS candidate_snapshots (
         id INTEGER PRIMARY KEY AUTOINCREMENT, t TEXT NOT NULL, size_bert TEXT NOT NULL,
+        strategy_fingerprint TEXT NOT NULL DEFAULT 'legacy',
+        economic_fingerprint TEXT NOT NULL DEFAULT 'legacy',
+        operational_fingerprint TEXT NOT NULL DEFAULT 'legacy',
         raydium_mid_usd TEXT NOT NULL, kraken_bid TEXT NOT NULL, kraken_ask TEXT NOT NULL,
         cross_venue_divergence_bps TEXT NOT NULL, book_age_ms INTEGER NOT NULL,
         executable_sell_price_usd TEXT NOT NULL, executable_buy_price_usd TEXT NOT NULL,
@@ -127,6 +144,9 @@ export class StateStore {
       CREATE INDEX IF NOT EXISTS idx_candidate_snapshots_t_size ON candidate_snapshots(t, size_bert);
       CREATE TABLE IF NOT EXISTS candidate_orders (
         candidate_order_id TEXT PRIMARY KEY, rung_index INTEGER NOT NULL,
+        strategy_fingerprint TEXT NOT NULL DEFAULT 'legacy',
+        economic_fingerprint TEXT NOT NULL DEFAULT 'legacy',
+        operational_fingerprint TEXT NOT NULL DEFAULT 'legacy',
         side TEXT NOT NULL CHECK (side IN ('buy','sell')), distance_bps TEXT NOT NULL,
         price TEXT NOT NULL, size_bert TEXT NOT NULL, remaining_bert TEXT NOT NULL,
         queue_ahead_at_placement_bert TEXT NOT NULL, queue_ahead_remaining_bert TEXT NOT NULL,
@@ -139,6 +159,9 @@ export class StateStore {
       CREATE INDEX IF NOT EXISTS idx_candidate_orders_updated_at ON candidate_orders(updated_at);
       CREATE TABLE IF NOT EXISTS candidate_fills (
         candidate_fill_id TEXT PRIMARY KEY, candidate_order_id TEXT NOT NULL,
+        strategy_fingerprint TEXT NOT NULL DEFAULT 'legacy',
+        economic_fingerprint TEXT NOT NULL DEFAULT 'legacy',
+        operational_fingerprint TEXT NOT NULL DEFAULT 'legacy',
         kraken_trade_id INTEGER NOT NULL, hedge_batch_id TEXT NOT NULL,
         side TEXT NOT NULL CHECK (side IN ('buy','sell')), distance_bps TEXT NOT NULL,
         fill_price_usd TEXT NOT NULL, volume_bert TEXT NOT NULL, order_remaining_bert TEXT NOT NULL,
@@ -155,6 +178,25 @@ export class StateStore {
       );
       CREATE INDEX IF NOT EXISTS idx_candidate_fills_t ON candidate_fills(t);
       CREATE INDEX IF NOT EXISTS idx_candidate_fills_batch ON candidate_fills(hedge_batch_id);
+      CREATE TABLE IF NOT EXISTS candidate_quote_attempts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        attempt_kind TEXT NOT NULL CHECK (attempt_kind IN ('snapshot','hedge')),
+        started_at TEXT NOT NULL, completed_at TEXT NOT NULL, duration_ms INTEGER NOT NULL,
+        requested_call_count INTEGER NOT NULL, provider_status TEXT NOT NULL,
+        http_status INTEGER, rate_limit_429_count INTEGER NOT NULL,
+        baseline_sample_age_ms INTEGER NOT NULL, strategy_fingerprint TEXT NOT NULL,
+        economic_fingerprint TEXT NOT NULL DEFAULT 'legacy',
+        operational_fingerprint TEXT NOT NULL DEFAULT 'legacy'
+      );
+      CREATE INDEX IF NOT EXISTS idx_candidate_quote_attempts_fingerprint_started
+        ON candidate_quote_attempts(strategy_fingerprint,started_at);
+      CREATE TABLE IF NOT EXISTS candidate_runtime_state (
+        singleton INTEGER PRIMARY KEY CHECK (singleton=1),
+        strategy_fingerprint TEXT NOT NULL, activated_at TEXT NOT NULL,
+        economic_fingerprint TEXT NOT NULL DEFAULT 'legacy',
+        operational_fingerprint TEXT NOT NULL DEFAULT 'legacy',
+        latched_at TEXT, latch_reason TEXT
+      );
       CREATE TABLE IF NOT EXISTS candidate_gate_periods (
         id INTEGER PRIMARY KEY AUTOINCREMENT, gate TEXT NOT NULL, started_at TEXT NOT NULL,
         ended_at TEXT, detail_json TEXT NOT NULL
@@ -179,6 +221,30 @@ export class StateStore {
     try { this.db.exec("ALTER TABLE hedges ADD COLUMN bert_notional TEXT"); } catch { /* column already exists */ }
     try { this.db.exec("ALTER TABLE candidate_fills ADD COLUMN hedge_resolved_at TEXT"); } catch { /* column already exists */ }
     try { this.db.exec("ALTER TABLE candidate_fills ADD COLUMN hedge_terminal_reason TEXT"); } catch { /* column already exists */ }
+    try { this.db.exec("ALTER TABLE candidate_snapshots ADD COLUMN strategy_fingerprint TEXT NOT NULL DEFAULT 'legacy'"); } catch { /* column already exists */ }
+    try { this.db.exec("ALTER TABLE candidate_orders ADD COLUMN strategy_fingerprint TEXT NOT NULL DEFAULT 'legacy'"); } catch { /* column already exists */ }
+    try { this.db.exec("ALTER TABLE candidate_fills ADD COLUMN strategy_fingerprint TEXT NOT NULL DEFAULT 'legacy'"); } catch { /* column already exists */ }
+    for (const table of [
+      'candidate_snapshots', 'candidate_orders', 'candidate_fills',
+      'candidate_quote_attempts', 'candidate_runtime_state',
+    ]) {
+      try { this.db.exec(`ALTER TABLE ${table} ADD COLUMN economic_fingerprint TEXT NOT NULL DEFAULT 'legacy'`); } catch { /* column already exists */ }
+      try { this.db.exec(`ALTER TABLE ${table} ADD COLUMN operational_fingerprint TEXT NOT NULL DEFAULT 'legacy'`); } catch { /* column already exists */ }
+      this.db.exec(`UPDATE ${table} SET economic_fingerprint=strategy_fingerprint
+        WHERE economic_fingerprint='legacy' AND strategy_fingerprint<>'legacy'`);
+      this.db.exec(`UPDATE ${table} SET operational_fingerprint=strategy_fingerprint
+        WHERE operational_fingerprint='legacy' AND strategy_fingerprint<>'legacy'`);
+    }
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_candidate_snapshots_economic_t
+        ON candidate_snapshots(economic_fingerprint,t);
+      CREATE INDEX IF NOT EXISTS idx_candidate_orders_economic_updated
+        ON candidate_orders(economic_fingerprint,updated_at);
+      CREATE INDEX IF NOT EXISTS idx_candidate_fills_economic_t
+        ON candidate_fills(economic_fingerprint,t);
+      CREATE INDEX IF NOT EXISTS idx_candidate_quote_attempts_economic_started
+        ON candidate_quote_attempts(economic_fingerprint,started_at);
+    `);
   }
 
   insertOrder(r: OrderRow): void {
@@ -286,12 +352,19 @@ export class StateStore {
     });
   }
 
-  insertCandidateSnapshot(snapshot: CandidateEconomicSnapshot, recordedAt = new Date()): void {
+  insertCandidateSnapshot(
+    snapshot: CandidateEconomicSnapshot,
+    economicFingerprint: string,
+    operationalFingerprint: string,
+    recordedAt = new Date(),
+  ): void {
     const insert = this.db.prepare(`INSERT INTO candidate_snapshots
-      (t,size_bert,raydium_mid_usd,kraken_bid,kraken_ask,cross_venue_divergence_bps,book_age_ms,
+      (t,size_bert,strategy_fingerprint,economic_fingerprint,operational_fingerprint,
+       raydium_mid_usd,kraken_bid,kraken_ask,cross_venue_divergence_bps,book_age_ms,
        executable_sell_price_usd,executable_buy_price_usd,sell_route_deviation_bps,buy_route_deviation_bps,
        sell_impact_bps,buy_impact_bps)
-      VALUES (@t,@sizeBert,@raydiumMidUsd,@krakenBid,@krakenAsk,@crossVenueDivergenceBps,@bookAgeMs,
+      VALUES (@t,@sizeBert,@economicFingerprint,@economicFingerprint,@operationalFingerprint,
+       @raydiumMidUsd,@krakenBid,@krakenAsk,@crossVenueDivergenceBps,@bookAgeMs,
        @executableSellPriceUsd,@executableBuyPriceUsd,@sellRouteDeviationBps,@buyRouteDeviationBps,
        @sellImpactBps,@buyImpactBps)`);
     const bookAgeMs = Math.max(0, recordedAt.getTime() - snapshot.book.t.getTime());
@@ -300,6 +373,8 @@ export class StateStore {
         insert.run({
           t: snapshot.asOf.toISOString(),
           sizeBert: reference.sizeBert.toString(),
+          economicFingerprint,
+          operationalFingerprint,
           raydiumMidUsd: snapshot.raydiumMidUsd.toString(),
           krakenBid: snapshot.krakenBid.toString(),
           krakenAsk: snapshot.krakenAsk.toString(),
@@ -318,11 +393,13 @@ export class StateStore {
 
   upsertCandidateOrder(r: CandidateOrder): void {
     this.db.prepare(`INSERT INTO candidate_orders
-      (candidate_order_id,rung_index,side,distance_bps,price,size_bert,remaining_bert,
+      (candidate_order_id,rung_index,strategy_fingerprint,economic_fingerprint,operational_fingerprint,
+       side,distance_bps,price,size_bert,remaining_bert,
        queue_ahead_at_placement_bert,queue_ahead_remaining_bert,reference_price_usd,reference_impact_bps,
        expected_gross_edge_bps,expected_normal_net_edge_bps,expected_stress_net_edge_bps,
        economic_snapshot_at,status,placed_at,updated_at)
-      VALUES (@candidateOrderId,@rungIndex,@side,@distanceBps,@price,@sizeBert,@remainingBert,
+      VALUES (@candidateOrderId,@rungIndex,@economicFingerprint,@economicFingerprint,@operationalFingerprint,
+       @side,@distanceBps,@price,@sizeBert,@remainingBert,
        @queueAheadAtPlacementBert,@queueAheadRemainingBert,@referencePriceUsd,@referenceImpactBps,
        @expectedGrossEdgeBps,@expectedNormalNetEdgeBps,@expectedStressNetEdgeBps,
        @economicSnapshotAt,'open',@placedAt,@updatedAt)
@@ -351,13 +428,15 @@ export class StateStore {
 
   upsertCandidateFill(r: CandidateFillRecord): void {
     this.db.prepare(`INSERT INTO candidate_fills
-      (candidate_fill_id,candidate_order_id,kraken_trade_id,hedge_batch_id,side,distance_bps,
+      (candidate_fill_id,candidate_order_id,strategy_fingerprint,economic_fingerprint,operational_fingerprint,
+       kraken_trade_id,hedge_batch_id,side,distance_bps,
        fill_price_usd,volume_bert,order_remaining_bert,dex_hedge_price_usd,dex_impact_bps,gross_pnl_usd,
        normal_maker_fee_usd,normal_latency_cost_usd,normal_failure_reserve_usd,normal_transaction_cost_usd,
        normal_net_pnl_usd,stress_maker_fee_usd,stress_latency_cost_usd,stress_failure_reserve_usd,
        stress_transaction_cost_usd,stress_net_pnl_usd,hedge_status,economics_source,
        hedge_resolved_at,hedge_terminal_reason,t)
-      VALUES (@candidateFillId,@candidateOrderId,@krakenTradeId,@hedgeBatchId,@side,@distanceBps,
+      VALUES (@candidateFillId,@candidateOrderId,@economicFingerprint,@economicFingerprint,@operationalFingerprint,
+       @krakenTradeId,@hedgeBatchId,@side,@distanceBps,
        @fillPriceUsd,@volumeBert,@orderRemainingBert,@dexHedgePriceUsd,@dexImpactBps,@grossPnlUsd,
        @normalMakerFeeUsd,@normalLatencyCostUsd,@normalFailureReserveUsd,@normalTransactionCostUsd,
        @normalNetPnlUsd,@stressMakerFeeUsd,@stressLatencyCostUsd,@stressFailureReserveUsd,
@@ -393,6 +472,8 @@ export class StateStore {
     return this.db.prepare(`SELECT
       f.candidate_fill_id AS candidateFillId,
       f.candidate_order_id AS candidateOrderId,
+      f.economic_fingerprint AS economicFingerprint,
+      f.operational_fingerprint AS operationalFingerprint,
       f.kraken_trade_id AS krakenTradeId,
       f.hedge_batch_id AS hedgeBatchId,
       f.side,
@@ -407,6 +488,41 @@ export class StateStore {
       JOIN candidate_orders o ON o.candidate_order_id=f.candidate_order_id
       WHERE f.hedge_status='pending'
       ORDER BY f.t,f.candidate_fill_id`).all() as CandidatePendingFill[];
+  }
+
+  insertCandidateQuoteAttempt(r: CandidateQuoteAttemptRow): void {
+    this.db.prepare(`INSERT INTO candidate_quote_attempts
+      (attempt_kind,started_at,completed_at,duration_ms,requested_call_count,provider_status,
+       http_status,rate_limit_429_count,baseline_sample_age_ms,strategy_fingerprint,
+       economic_fingerprint,operational_fingerprint)
+      VALUES (@attemptKind,@startedAt,@completedAt,@durationMs,@requestedCallCount,@providerStatus,
+       @httpStatus,@rateLimit429Count,@baselineSampleAgeMs,@economicFingerprint,
+       @economicFingerprint,@operationalFingerprint)`).run(r);
+  }
+
+  pruneCandidateQuoteAttempts(beforeIso: string): number {
+    return this.db.prepare('DELETE FROM candidate_quote_attempts WHERE started_at < ?')
+      .run(beforeIso).changes;
+  }
+
+  setCandidateRuntimeState(
+    economicFingerprint: string,
+    operationalFingerprint: string,
+    activatedAt: string,
+  ): void {
+    this.db.prepare(`INSERT INTO candidate_runtime_state
+      (singleton,strategy_fingerprint,economic_fingerprint,operational_fingerprint,activated_at,latched_at,latch_reason)
+      VALUES (1,?,?,?,?,NULL,NULL)
+      ON CONFLICT(singleton) DO UPDATE SET strategy_fingerprint=excluded.strategy_fingerprint,
+       economic_fingerprint=excluded.economic_fingerprint,
+       operational_fingerprint=excluded.operational_fingerprint,
+       activated_at=excluded.activated_at,latched_at=NULL,latch_reason=NULL`)
+      .run(economicFingerprint, economicFingerprint, operationalFingerprint, activatedAt);
+  }
+
+  latchCandidateRuntime(reason: string, at: string): void {
+    this.db.prepare(`UPDATE candidate_runtime_state SET latched_at=?,latch_reason=? WHERE singleton=1`)
+      .run(at, reason);
   }
 
   syncCandidateGatePeriods(gates: Array<{ gate: string; detailJson: string }>, t: string): void {
