@@ -9,7 +9,8 @@ const rpc = {
   getWalletBalances: vi.fn(async () => ({ bert: '2564', sol: '0.72' })),
 };
 const solRef = { fetchSolUsd: vi.fn().mockResolvedValue('86.12') };
-const submitter = { submitProtected: vi.fn(async () => 'SIG-DEAD-BEEF') };
+// submitProtected returns the tx signature plus the (unusable-for-polling) Jito bundle id.
+const submitter = { submitProtected: vi.fn(async () => ({ txSig: 'SIG-DEAD-BEEF', bundleId: 'BUNDLE-1' })) };
 
 describe('RaydiumAmmClient swap path', () => {
   it('estimateSwap calls jupiter quote with the right mints and slippage', async () => {

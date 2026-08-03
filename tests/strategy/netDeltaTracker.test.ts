@@ -25,4 +25,28 @@ describe('NetDeltaTracker', () => {
     });
     expect(snap.bertNet.toString()).toBe('2500');
   });
+
+  it('in-flight DEX sell-hedge (positive outflow) reduces bertNet', () => {
+    const t = new NetDeltaTracker();
+    const snap = t.snapshot({
+      kraken: { base: new Decimal('1000'), quote: new Decimal('0') },
+      dex:    { bert:  new Decimal('2000'), sol:   new Decimal('0') },
+      // Kraken buy filled 500 BERT → we sell 500 BERT on the DEX; BERT is leaving.
+      inFlightHedgesBert: new Decimal('500'),
+      midUsd: new Decimal('0.0177'),
+    });
+    expect(snap.bertNet.toString()).toBe('2500');
+  });
+
+  it('in-flight DEX buy-hedge (negative outflow) increases bertNet', () => {
+    const t = new NetDeltaTracker();
+    const snap = t.snapshot({
+      kraken: { base: new Decimal('1000'), quote: new Decimal('0') },
+      dex:    { bert:  new Decimal('2000'), sol:   new Decimal('0') },
+      // Kraken sell filled 500 BERT → we buy 500 BERT back on the DEX; BERT is arriving.
+      inFlightHedgesBert: new Decimal('-500'),
+      midUsd: new Decimal('0.0177'),
+    });
+    expect(snap.bertNet.toString()).toBe('3500');
+  });
 });

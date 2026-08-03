@@ -27,6 +27,9 @@ export const DEFAULT_JITO_TIP_ACCOUNTS = [
   '3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT',
 ];
 
+/** Submission is bounded so a hung block engine cannot strand a hedge in flight. */
+export const JITO_SUBMIT_TIMEOUT_MS = 15_000;
+
 export interface JitoClientOptions {
   blockEngineUrl: string;
   tipAccounts?: string[];
@@ -64,7 +67,7 @@ export class JitoClient {
    * the actual tip transfer instruction must already be included
    * inside one of the supplied transactions. We log it for traceability.
    */
-  async submitBundle(serializedTxs: string[], tipLamports: number): Promise<string> {
+  async submitBundle(serializedTxs: string[], tipLamports: number, timeoutMs?: number): Promise<string> {
     if (serializedTxs.length === 0) {
       throw new Error('jito: submitBundle called with empty tx list');
     }
@@ -78,6 +81,8 @@ export class JitoClient {
         method: 'sendBundle',
         params: [serializedTxs, { encoding: 'base64' }],
       }),
+      // Bounded: a hung block engine must surface as a failure the hedge path can act on.
+      signal: AbortSignal.timeout(timeoutMs ?? JITO_SUBMIT_TIMEOUT_MS),
     });
 
     if (!res.ok) {

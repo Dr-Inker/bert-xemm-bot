@@ -5,6 +5,26 @@ import { spawnKrakenStream, ndjsonLines } from './krakenStream.js';
 import { toWsPair } from './krakenPair.js';
 import { VenueError, type HedgeVenue, type PlaceLimitParams, type AmendParams } from './hedgeVenue.js';
 import type { Fill, OrderUpdate, BookSnapshot, Order, FeeTier } from '../types.js';
+import { logger } from '../logger.js';
+
+// Conservative fee assumption used when Kraken does not report a tier for our pair.
+// Deliberately worse than any tier we expect to trade on, so a missing response can
+// only ever make quotes wider, never tighter.
+export const FEE_TIER_FALLBACK_MAKER_BPS = 25;
+export const FEE_TIER_FALLBACK_TAKER_BPS = 40;
+
+/**
+ * Kraken reports fees as percent strings. Validates the WHOLE string: parseFloat('0garbage')
+ * is 0, which would read as a free maker fee and wave through unprofitable quotes.
+ * Returns null unless the entire value parses to a finite, non-negative number.
+ */
+function parseFeePct(raw: string | undefined): number | null {
+  if (raw === undefined) return null;
+  const trimmed = raw.trim();
+  if (trimmed === '') return null;
+  const v = Number(trimmed);
+  return Number.isFinite(v) && v >= 0 ? v : null;
+}
 
 export interface KrakenClientConfig {
   cliBinaryPath: string;
@@ -160,8 +180,21 @@ export class KrakenClient implements HedgeVenue {
   async feeTier(): Promise<FeeTier> {
     const j = await this.runJson<{ fees?: Record<string, { fee_maker?: string; fee?: string }> }>(['volume', '--pair', this.cfg.pair]);
     const k = this.cfg.pair;
-    const maker = j.fees?.[k]?.fee_maker ?? '0.16';
-    const taker = j.fees?.[k]?.fee ?? '0.26';
-    return { makerBps: Math.round(parseFloat(maker) * 100), takerBps: Math.round(parseFloat(taker) * 100) };
+    const entry = j.fees?.[k];
+    // Only a finite, non-negative percentage is usable. NaN in particular must never escape:
+    // every comparison against it is false, so a NaN fee reads as "costs nothing" downstream
+    // in the edge check and would wave through quotes that are actually unprofitable.
+    const maker = parseFeePct(entry?.fee_maker);
+    const taker = parseFeePct(entry?.fee);
+    if (maker === null || taker === null) {
+      // Fail conservative: an unknown fee tier must never make quoting look cheaper
+      // than reality, so assume the worst public tier rather than our current one.
+      logger.warn(
+        { pair: k, availableKeys: Object.keys(j.fees ?? {}), rawMaker: entry?.fee_maker, rawTaker: entry?.fee },
+        'kraken volume response missing or unusable fee tier for pair; using conservative fallback (25/40 bps)',
+      );
+      return { makerBps: FEE_TIER_FALLBACK_MAKER_BPS, takerBps: FEE_TIER_FALLBACK_TAKER_BPS };
+    }
+    return { makerBps: Math.round(maker * 100), takerBps: Math.round(taker * 100) };
   }
 }

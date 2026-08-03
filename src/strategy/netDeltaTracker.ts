@@ -3,6 +3,13 @@ import Decimal from 'decimal.js';
 export interface NetDeltaInput {
   kraken: { base: Decimal; quote: Decimal };
   dex: { bert: Decimal; sol: Decimal };
+  /**
+   * Signed net BERT *outflow* of hedges currently in flight:
+   *   positive → a DEX sell-hedge is in flight, BERT is on its way out
+   *   negative → a DEX buy-hedge is in flight, BERT is on its way in
+   * In-flight hedges are conservatively counted as already settled, so the value is
+   * subtracted from the observed balances (a negative outflow therefore adds BERT).
+   */
   inFlightHedgesBert: Decimal;
   midUsd: Decimal;
 }

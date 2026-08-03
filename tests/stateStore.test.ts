@@ -86,6 +86,13 @@ describe('StateStore', () => {
     expect(total.toString()).toBe('1500');
   });
 
+  it('sumInFlightHedgesBert nets signed hedge notionals (buy-hedges are negative)', () => {
+    store.insertHedgeRow({ hedgeId:'s1', triggeringFillId:'f1', status:'tx_submitted', jupiterQuote:null, txSig:'x1', slippageRealized:null, bertNotional:'1000', tIntent:'2026-05-21T00:00:00Z', tConfirmed:null });
+    store.insertHedgeRow({ hedgeId:'s2', triggeringFillId:'f2', status:'intent_queued', jupiterQuote:null, txSig:null, slippageRealized:null, bertNotional:'-400', tIntent:'2026-05-21T00:00:00Z', tConfirmed:null });
+    const total = store.sumInFlightHedgesBert();
+    expect(total.toString()).toBe('600');
+  });
+
   it('listOpenOrders returns only orders with status=open', () => {
     store.insertOrder({
       clOrdId: 'cl-open-1', krakenTxid: 'O1', side: 'buy',
