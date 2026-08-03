@@ -73,6 +73,7 @@ export class PaperFillEngine {
     if (this.seenTradeIds.has(t.tradeId)) return;
     this.seenTradeIds.add(t.tradeId);
     if (this.seenTradeIds.size > 20_000) this.seenTradeIds = new Set([...this.seenTradeIds].slice(-10_000));
+    if (t.side === null) return;
     const hitSide: Side = t.side === 'sell' ? 'buy' : 'sell';
     for (const [key, order] of [...this.orders]) {
       if (order.side !== hitSide || !tradesThrough(t, order)) continue;

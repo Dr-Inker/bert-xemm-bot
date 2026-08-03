@@ -62,6 +62,14 @@ describe('config', () => {
     expect(cfg.mode).toBe('observer');
     expect(cfg.quoter.cadenceMs).toBe(2500);
     expect(cfg.watchdog.conditions.netDeltaUsd).toBe(500);
+    expect(cfg.candidate.enabled).toBe(true);
+    expect(cfg.candidate.ladder).toEqual([
+      { sizeBert: 1000, distanceBps: 175 },
+      { sizeBert: 500, distanceBps: 400 },
+      { sizeBert: 500, distanceBps: 800 },
+    ]);
+    expect(cfg.candidate.normalFriction.makerFeeBps).toBe(23);
+    expect(cfg.candidate.stressFriction.transactionCostUsd).toBe(0.04);
   });
 
   it('rejects invalid mode (with otherwise-valid config)', () => {

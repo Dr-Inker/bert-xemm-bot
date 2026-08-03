@@ -14,6 +14,13 @@ interface RawPaperFill {
   maker_fee_usd: string; transaction_cost_usd: string; latency_cost_usd: string;
   failure_reserve_usd: string; net_pnl_usd: string; t: string;
 }
+interface RawCandidateFill {
+  candidate_fill_id: string; side: string; distance_bps: string; volume_bert: string;
+  gross_pnl_usd: string; normal_net_pnl_usd: string; stress_net_pnl_usd: string;
+  hedge_status: string; economics_source: string; t: string;
+}
+interface RawGatePeriod { gate: string; started_at: string; ended_at: string | null }
+interface RawCloseReason { close_reason: string; n: number }
 
 const dbPath = process.env['BERT_XEMM_DB'] ?? '/var/lib/bert-xemm-bot/state.db';
 const outputPath = process.env['BERT_XEMM_DASHBOARD_JSON'] ?? '/var/www/drinkerlabs/bert-mm/data.json';
@@ -26,6 +33,17 @@ const paperRows = db.prepare(`SELECT paper_fill_id,side,volume_bert,gross_pnl_us
   transaction_cost_usd,latency_cost_usd,failure_reserve_usd,net_pnl_usd,t
   FROM paper_fills WHERE t >= ? ORDER BY t ASC`).all(since) as RawPaperFill[];
 const openPaperOrders = (db.prepare(`SELECT COUNT(*) n FROM paper_orders WHERE status='open'`).get() as { n: number }).n;
+const candidateRows = db.prepare(`SELECT candidate_fill_id,side,distance_bps,volume_bert,gross_pnl_usd,
+  normal_net_pnl_usd,stress_net_pnl_usd,hedge_status,economics_source,t
+  FROM candidate_fills WHERE t >= ? ORDER BY t ASC`).all(since) as RawCandidateFill[];
+const openCandidateOrders = (db.prepare(`SELECT COUNT(*) n FROM candidate_orders WHERE status='open'`).get() as { n: number }).n;
+const publicTrades24h = (db.prepare(`SELECT COUNT(*) n FROM public_trades WHERE t >= ?`).get(since) as { n: number }).n;
+const candidateSnapshots24h = (db.prepare(`SELECT COUNT(DISTINCT t) n FROM candidate_snapshots WHERE t >= ?`).get(since) as { n: number }).n;
+const latestCandidateSnapshot = (db.prepare(`SELECT MAX(t) t FROM candidate_snapshots`).get() as { t: string | null }).t;
+const gateRows = db.prepare(`SELECT gate,started_at,ended_at FROM candidate_gate_periods
+  WHERE ended_at IS NULL OR ended_at >= ? OR started_at >= ? ORDER BY started_at ASC`).all(since, since) as RawGatePeriod[];
+const closeReasons = db.prepare(`SELECT close_reason,COUNT(*) n FROM candidate_orders
+  WHERE updated_at >= ? AND close_reason IS NOT NULL GROUP BY close_reason ORDER BY close_reason`).all(since) as RawCloseReason[];
 db.close();
 
 const samples = rows.map(r => ({
@@ -61,6 +79,36 @@ const paperFills = paperRows.map(r => {
   return { ...fill, cumulativePnlUsd: equity };
 });
 const sum = (key: keyof (typeof paperFills)[number]): number => paperFills.reduce((n, x) => n + Number(x[key]), 0);
+const candidateFills = candidateRows.map(r => ({
+  id: r.candidate_fill_id,
+  side: r.side,
+  distanceBps: Number(r.distance_bps),
+  volumeBert: Number(r.volume_bert),
+  grossPnlUsd: Number(r.gross_pnl_usd),
+  normalNetPnlUsd: Number(r.normal_net_pnl_usd),
+  stressNetPnlUsd: Number(r.stress_net_pnl_usd),
+  hedgeStatus: r.hedge_status,
+  economicsSource: r.economics_source,
+  t: r.t,
+}));
+const simulatedCandidateFills = candidateFills.filter(fill => fill.hedgeStatus === 'simulated');
+const candidateSum = (key: 'grossPnlUsd' | 'normalNetPnlUsd' | 'stressNetPnlUsd'): number =>
+  simulatedCandidateFills.reduce((total, fill) => total + fill[key], 0);
+const candidateDrawdowns = dualDrawdown(simulatedCandidateFills);
+const nowMs = Date.now();
+const gateSummary = [...new Set(gateRows.map(row => row.gate))].sort().map(gate => {
+  const periods = gateRows.filter(row => row.gate === gate);
+  return {
+    gate,
+    periods24h: periods.length,
+    durationMs24h: periods.reduce((total, period) => {
+      const start = Math.max(Date.parse(period.started_at), Date.parse(since));
+      const end = Math.min(period.ended_at ? Date.parse(period.ended_at) : nowMs, nowMs);
+      return total + Math.max(0, end - start);
+    }, 0),
+    active: periods.some(period => period.ended_at === null),
+  };
+});
 const payload = {
   schemaVersion: 1,
   generatedAt: new Date().toISOString(),
@@ -79,6 +127,24 @@ const payload = {
     latencyCostsUsd24h: sum('latencyCostUsd'), failureReserveUsd24h: sum('failureReserveUsd'),
     maxDrawdownUsd24h: maxDrawdownUsd, recentFills: paperFills.slice(-20).reverse(),
   },
+  candidate: {
+    latestSnapshotT: latestCandidateSnapshot,
+    snapshots24h: candidateSnapshots24h,
+    publicTrades24h,
+    openOrders: openCandidateOrders,
+    fills24h: candidateFills.length,
+    simulatedFills24h: simulatedCandidateFills.length,
+    pendingFills24h: candidateFills.length - simulatedCandidateFills.length,
+    grossPnlUsd24h: candidateSum('grossPnlUsd'),
+    normalNetPnlUsd24h: candidateSum('normalNetPnlUsd'),
+    stressNetPnlUsd24h: candidateSum('stressNetPnlUsd'),
+    normalMaxDrawdownUsd24h: candidateDrawdowns.normal,
+    stressMaxDrawdownUsd24h: candidateDrawdowns.stress,
+    closeReasons24h: Object.fromEntries(closeReasons.map(row => [row.close_reason, row.n])),
+    activeGates: gateSummary.filter(gate => gate.active).map(gate => gate.gate),
+    gateOutages24h: gateSummary,
+    recentFills: candidateFills.slice(-20).reverse(),
+  },
 };
 await mkdir(dirname(outputPath), { recursive: true });
 const tmp = `${outputPath}.tmp`;
@@ -93,4 +159,17 @@ function median(xs: number[]): number | null {
   const ys = [...xs].sort((a, b) => a - b);
   const m = Math.floor(ys.length / 2);
   return ys.length % 2 ? ys[m]! : (ys[m - 1]! + ys[m]!) / 2;
+}
+function dualDrawdown(fills: Array<{ normalNetPnlUsd: number; stressNetPnlUsd: number }>): { normal: number; stress: number } {
+  let normalEquity = 0, normalPeak = 0, normal = 0;
+  let stressEquity = 0, stressPeak = 0, stress = 0;
+  for (const fill of fills) {
+    normalEquity += fill.normalNetPnlUsd;
+    normalPeak = Math.max(normalPeak, normalEquity);
+    normal = Math.max(normal, normalPeak - normalEquity);
+    stressEquity += fill.stressNetPnlUsd;
+    stressPeak = Math.max(stressPeak, stressEquity);
+    stress = Math.max(stress, stressPeak - stressEquity);
+  }
+  return { normal, stress };
 }

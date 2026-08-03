@@ -2,6 +2,48 @@ import { z } from 'zod';
 import { readFileSync } from 'node:fs';
 import { parse as parseYaml } from 'yaml';
 
+const CandidateFrictionSchema = z.object({
+  makerFeeBps: z.number().nonnegative(),
+  latencyPenaltyBps: z.number().nonnegative(),
+  failedHedgeReserveBps: z.number().nonnegative(),
+  transactionCostUsd: z.number().nonnegative(),
+});
+
+const CandidateConfigSchema = z.object({
+  enabled: z.boolean().default(true),
+  ladder: z.array(z.object({
+    sizeBert: z.number().positive(),
+    distanceBps: z.number().positive(),
+  })).min(1).default([
+    { sizeBert: 1000, distanceBps: 175 },
+    { sizeBert: 500, distanceBps: 400 },
+    { sizeBert: 500, distanceBps: 800 },
+  ]),
+  minAllInEdgeBps: z.number().nonnegative().default(75),
+  decisionCadenceMs: z.number().int().min(500).max(60_000).default(1000),
+  repriceThresholdBps: z.number().nonnegative().default(10),
+  maxQuoteAgeMs: z.number().int().positive().default(3000),
+  crossVenueMaxBps: z.number().nonnegative().default(150),
+  routeVsReserveMaxBps: z.number().nonnegative().default(75),
+  maxBookAgeSec: z.number().int().positive().default(15),
+  drift5sBps: z.number().nonnegative().default(35),
+  drift30sBps: z.number().nonnegative().default(75),
+  driftResumeStableSec: z.number().int().positive().default(30),
+  maxActivePerSideBert: z.number().positive().default(2000),
+  normalFriction: CandidateFrictionSchema.default({
+    makerFeeBps: 23,
+    latencyPenaltyBps: 20,
+    failedHedgeReserveBps: 10,
+    transactionCostUsd: 0.02,
+  }),
+  stressFriction: CandidateFrictionSchema.default({
+    makerFeeBps: 25,
+    latencyPenaltyBps: 40,
+    failedHedgeReserveBps: 20,
+    transactionCostUsd: 0.04,
+  }),
+}).default({});
+
 export const BotConfigSchema = z.object({
   mode: z.enum(['observer', 'live']),
   enabled: z.boolean(),
@@ -38,6 +80,8 @@ export const BotConfigSchema = z.object({
     failedHedgeReserveBps: z.number().nonnegative().default(10),
     transactionCostUsd: z.number().nonnegative().default(0.02),
   }).default({ enabled: true, minNetEdgeBps: 40, latencyPenaltyBps: 20, failedHedgeReserveBps: 10, transactionCostUsd: 0.02 }),
+
+  candidate: CandidateConfigSchema,
 
   quoter: z.object({
     cadenceMs: z.number().int().min(500).max(60_000),

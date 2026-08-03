@@ -14,9 +14,15 @@ import { trustedMid } from './priceOracle.js';
 import { Raydium24hVol } from './venues/raydium24hVol.js';
 import { PnlTracker } from './strategy/pnlTracker.js';
 import { AdverseFillTracker } from './strategy/adverseFillTracker.js';
-import { measureObserverEconomics } from './observerEconomics.js';
+import { measureExecutableBuyExactOut, measureExecutableSell, measureObserverEconomics } from './observerEconomics.js';
 import { PaperFillEngine, type PaperQuoteCandidate } from './paperFillEngine.js';
 import { KrakenPublicTrades } from './venues/krakenPublicTrades.js';
+import { CandidateFillEngine } from './candidateFillEngine.js';
+import {
+  JupiterQuoteRateLimiter,
+  measureCandidateSnapshot,
+  type CandidateEconomicSnapshot,
+} from './candidateQuoteSampler.js';
 import {
   condNetDelta, condKraken24hMin, condSolUsd1hMove, condStaleData,
   condRpcBurn, condRaydium24hMin, condDailyPnl, condAdverseFill,
@@ -116,7 +122,9 @@ async function main(): Promise<void> {
   const bookCache = new BookCache(cfg.kraken.pair, logger);
   bookCache.run(cex, cfg.kraken.pair, 10).catch(e => logger.error({ err: e }, 'bookCache run crashed'));
   const publicTrades = new KrakenPublicTrades(cfg.kraken.cliBinaryPath, cfg.kraken.pair, logger);
+  const quoteLimiter = new JupiterQuoteRateLimiter(cfg.maxRpcCallsPerSec);
   store.cancelAllOpenPaperOrders(new Date().toISOString(), 'process_restart');
+  store.cancelAllOpenCandidateOrders(new Date().toISOString(), 'process_restart');
   const paper = new PaperFillEngine({
     minNetEdgeBps: cfg.paper.minNetEdgeBps,
     driftThresholdBps: cfg.quoter.driftThresholdBps,
@@ -131,6 +139,7 @@ async function main(): Promise<void> {
         sizeBert: size, krakenBid: fillPrice, krakenAsk: fillPrice,
         raydiumMidUsd: mid.mid, solUsd: mid.solUsd, makerFeeBps: fee.makerBps,
         jupiterBaseUrl: cfg.jupiter.baseUrl, slippageBps: cfg.jupiter.maxSlippageBps,
+        quote: quoteLimiter.quote,
       });
       return {
         dexPriceUsd: side === 'buy' ? e.dexSellPriceUsd : e.dexBuyPriceUsd,
@@ -139,8 +148,46 @@ async function main(): Promise<void> {
       };
     },
   });
-  publicTrades.onTrade(t => paper.onTrade(t));
-  if (cfg.mode === 'observer' && cfg.paper.enabled) {
+  const candidate = cfg.mode === 'observer' && cfg.candidate.enabled
+    ? new CandidateFillEngine({
+        ladder: cfg.candidate.ladder,
+        minAllInEdgeBps: cfg.candidate.minAllInEdgeBps,
+        repriceThresholdBps: cfg.candidate.repriceThresholdBps,
+        maxQuoteAgeMs: cfg.candidate.maxQuoteAgeMs,
+        crossVenueMaxBps: cfg.candidate.crossVenueMaxBps,
+        routeVsReserveMaxBps: cfg.candidate.routeVsReserveMaxBps,
+        maxBookAgeSec: cfg.candidate.maxBookAgeSec,
+        drift5sBps: cfg.candidate.drift5sBps,
+        drift30sBps: cfg.candidate.drift30sBps,
+        driftResumeStableSec: cfg.candidate.driftResumeStableSec,
+        maxActivePerSideBert: cfg.candidate.maxActivePerSideBert,
+        normalFriction: cfg.candidate.normalFriction,
+        stressFriction: cfg.candidate.stressFriction,
+        store,
+        hedgeBatch: async (side, sizeBert) => {
+          const mid = await dex.poolMidUsd();
+          const input = {
+            sizeBert,
+            raydiumMidUsd: mid.mid,
+            solUsd: mid.solUsd,
+            jupiterBaseUrl: cfg.jupiter.baseUrl,
+            slippageBps: cfg.jupiter.maxSlippageBps,
+            quote: quoteLimiter.quote,
+          };
+          const executable = side === 'buy'
+            ? await measureExecutableSell(input)
+            : await measureExecutableBuyExactOut(input);
+          return { dexPriceUsd: executable.priceUsd, dexImpactBps: executable.impactBps };
+        },
+      })
+    : null;
+  candidate?.restorePendingFills(store.listPendingCandidateFills());
+  publicTrades.onBatch(trades => {
+    store.insertPublicTrades(trades);
+    return candidate?.onTradeBatch(trades);
+  });
+  if (cfg.paper.enabled) publicTrades.onTrade(t => paper.onTrade(t));
+  if (cfg.mode === 'observer' && (cfg.paper.enabled || candidate !== null)) {
     publicTrades.run().catch(e => logger.error({ err: e }, 'public trades stream crashed'));
   }
 
@@ -317,6 +364,7 @@ async function main(): Promise<void> {
           sizeBert, krakenBid: bid, krakenAsk: ask, raydiumMidUsd: mid.mid,
           solUsd: mid.solUsd, makerFeeBps: fee.makerBps,
           jupiterBaseUrl: cfg.jupiter.baseUrl, slippageBps: cfg.jupiter.maxSlippageBps,
+          quote: quoteLimiter.quote,
         });
         store.insertObserverSample({
           t: new Date().toISOString(), sizeBert: sizeBert.toString(),
@@ -351,6 +399,48 @@ async function main(): Promise<void> {
     void observerTick().catch(err => logger.error({ err }, 'observer initial tick'));
   }
 
+  let candidateTimer: NodeJS.Timeout | undefined;
+  let candidateSnapshot: CandidateEconomicSnapshot | null = null;
+  let candidateRefreshInFlight = false;
+  const refreshCandidateSnapshot = async (): Promise<void> => {
+    if (!candidate || candidateRefreshInFlight) return;
+    candidateRefreshInFlight = true;
+    try {
+      const book = bookCache.snapshot();
+      if (!book.bids[0] || !book.asks[0]) throw new Error('waiting for complete Kraken book');
+      const mid = await dex.poolMidUsd();
+      const snapshot = await measureCandidateSnapshot({
+        sizesBert: cfg.candidate.ladder.map(rung => new Decimal(rung.sizeBert)),
+        raydiumMidUsd: mid.mid,
+        solUsd: mid.solUsd,
+        book,
+        jupiterBaseUrl: cfg.jupiter.baseUrl,
+        slippageBps: cfg.jupiter.maxSlippageBps,
+        quote: quoteLimiter.quote,
+      });
+      candidateSnapshot = snapshot;
+      candidate.recordRefreshSuccess();
+      store.insertCandidateSnapshot(snapshot);
+    } catch (err) {
+      candidate.recordRefreshFailure();
+      logger.warn({ err }, 'candidate: complete executable snapshot refresh failed');
+    } finally {
+      candidateRefreshInFlight = false;
+    }
+  };
+  const candidateTick = (): void => {
+    if (!candidate) return;
+    candidate.updateQuotes(candidateSnapshot, new Date());
+    if (candidate.hasPendingHedge()) {
+      void candidate.retryPendingHedges().catch(err => logger.warn({ err }, 'candidate: simulated hedge retry failed'));
+    }
+    void refreshCandidateSnapshot();
+  };
+  if (candidate) {
+    candidateTimer = setInterval(candidateTick, cfg.candidate.decisionCadenceMs);
+    candidateTick();
+  }
+
   // Heartbeat ticker — touches the file every 5s so ops/heartbeat-check.sh sees
   // a fresh mtime. Independent of the three main loops so any one of them
   // hanging still surfaces as a heartbeat-stale alert at the next 5s tick.
@@ -369,6 +459,7 @@ async function main(): Promise<void> {
     clearInterval(quoterTimer);
     clearInterval(heartbeatTimer);
     if (observerTimer) clearInterval(observerTimer);
+    if (candidateTimer) clearInterval(candidateTimer);
     wdLoop.stop();
     fillLoop.shutdown();
     bookCache.shutdown();
