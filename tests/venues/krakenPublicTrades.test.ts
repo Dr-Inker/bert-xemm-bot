@@ -24,7 +24,10 @@ describe('KrakenPublicTrades', () => {
     const logger = { warn: vi.fn() };
     const stream = new KrakenPublicTrades('/kraken', 'BERTUSD', logger as never);
     const batches: Array<Array<{ tradeId: number; side: string | null }>> = [];
+    const deliveryOrder: string[] = [];
+    stream.onTrade(trade => { deliveryOrder.push(`trade:${trade.tradeId}`); });
     stream.onBatch(trades => {
+      deliveryOrder.push('batch');
       batches.push(trades.map(trade => ({ tradeId: trade.tradeId, side: trade.side })));
       stream.shutdown();
     });
@@ -34,5 +37,6 @@ describe('KrakenPublicTrades', () => {
       { tradeId: 1, side: 'sell' },
       { tradeId: 2, side: null },
     ]]);
+    expect(deliveryOrder).toEqual(['trade:1', 'trade:2', 'batch']);
   });
 });

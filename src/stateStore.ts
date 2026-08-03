@@ -37,6 +37,9 @@ export class StateStore {
   private db: DB;
   constructor(path: string) {
     this.db = new Database(path);
+    // Enforce the declared order/trade relationships on all new writes.
+    // Existing rows are not retroactively rejected by SQLite.
+    this.db.pragma('foreign_keys = ON');
     if (path !== ':memory:') this.db.pragma('journal_mode = WAL');
     this.migrate();
   }
@@ -133,6 +136,7 @@ export class StateStore {
         status TEXT NOT NULL, placed_at TEXT NOT NULL, updated_at TEXT NOT NULL, close_reason TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_candidate_orders_status ON candidate_orders(status);
+      CREATE INDEX IF NOT EXISTS idx_candidate_orders_updated_at ON candidate_orders(updated_at);
       CREATE TABLE IF NOT EXISTS candidate_fills (
         candidate_fill_id TEXT PRIMARY KEY, candidate_order_id TEXT NOT NULL,
         kraken_trade_id INTEGER NOT NULL, hedge_batch_id TEXT NOT NULL,
@@ -144,7 +148,8 @@ export class StateStore {
         normal_net_pnl_usd TEXT NOT NULL, stress_maker_fee_usd TEXT NOT NULL,
         stress_latency_cost_usd TEXT NOT NULL, stress_failure_reserve_usd TEXT NOT NULL,
         stress_transaction_cost_usd TEXT NOT NULL, stress_net_pnl_usd TEXT NOT NULL,
-        hedge_status TEXT NOT NULL, economics_source TEXT NOT NULL, t TEXT NOT NULL,
+        hedge_status TEXT NOT NULL, economics_source TEXT NOT NULL,
+        hedge_resolved_at TEXT, hedge_terminal_reason TEXT, t TEXT NOT NULL,
         FOREIGN KEY (candidate_order_id) REFERENCES candidate_orders(candidate_order_id),
         FOREIGN KEY (kraken_trade_id) REFERENCES public_trades(trade_id)
       );
@@ -156,6 +161,7 @@ export class StateStore {
       );
       CREATE UNIQUE INDEX IF NOT EXISTS idx_candidate_gate_open
         ON candidate_gate_periods(gate) WHERE ended_at IS NULL;
+      CREATE INDEX IF NOT EXISTS idx_candidate_gate_started_at ON candidate_gate_periods(started_at);
       CREATE TABLE IF NOT EXISTS kill_events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         t TEXT NOT NULL,
@@ -171,6 +177,8 @@ export class StateStore {
     // Idempotent column add for DBs created before bert_notional existed.
     // SQLite errors if the column is already present; swallow safely.
     try { this.db.exec("ALTER TABLE hedges ADD COLUMN bert_notional TEXT"); } catch { /* column already exists */ }
+    try { this.db.exec("ALTER TABLE candidate_fills ADD COLUMN hedge_resolved_at TEXT"); } catch { /* column already exists */ }
+    try { this.db.exec("ALTER TABLE candidate_fills ADD COLUMN hedge_terminal_reason TEXT"); } catch { /* column already exists */ }
   }
 
   insertOrder(r: OrderRow): void {
@@ -347,12 +355,14 @@ export class StateStore {
        fill_price_usd,volume_bert,order_remaining_bert,dex_hedge_price_usd,dex_impact_bps,gross_pnl_usd,
        normal_maker_fee_usd,normal_latency_cost_usd,normal_failure_reserve_usd,normal_transaction_cost_usd,
        normal_net_pnl_usd,stress_maker_fee_usd,stress_latency_cost_usd,stress_failure_reserve_usd,
-       stress_transaction_cost_usd,stress_net_pnl_usd,hedge_status,economics_source,t)
+       stress_transaction_cost_usd,stress_net_pnl_usd,hedge_status,economics_source,
+       hedge_resolved_at,hedge_terminal_reason,t)
       VALUES (@candidateFillId,@candidateOrderId,@krakenTradeId,@hedgeBatchId,@side,@distanceBps,
        @fillPriceUsd,@volumeBert,@orderRemainingBert,@dexHedgePriceUsd,@dexImpactBps,@grossPnlUsd,
        @normalMakerFeeUsd,@normalLatencyCostUsd,@normalFailureReserveUsd,@normalTransactionCostUsd,
        @normalNetPnlUsd,@stressMakerFeeUsd,@stressLatencyCostUsd,@stressFailureReserveUsd,
-       @stressTransactionCostUsd,@stressNetPnlUsd,@hedgeStatus,@economicsSource,@t)
+       @stressTransactionCostUsd,@stressNetPnlUsd,@hedgeStatus,@economicsSource,
+       @hedgeResolvedAt,@hedgeTerminalReason,@t)
       ON CONFLICT(candidate_fill_id) DO UPDATE SET
        dex_hedge_price_usd=excluded.dex_hedge_price_usd,
        dex_impact_bps=excluded.dex_impact_bps,
@@ -368,7 +378,15 @@ export class StateStore {
        stress_transaction_cost_usd=excluded.stress_transaction_cost_usd,
        stress_net_pnl_usd=excluded.stress_net_pnl_usd,
        hedge_status=excluded.hedge_status,
-       economics_source=excluded.economics_source`).run(r);
+       economics_source=excluded.economics_source,
+       hedge_resolved_at=excluded.hedge_resolved_at,
+       hedge_terminal_reason=excluded.hedge_terminal_reason`).run(r);
+  }
+
+  abandonCandidateHedgeBatch(batchId: string, t: string, reason: string): void {
+    this.db.prepare(`UPDATE candidate_fills
+      SET hedge_status='abandoned',hedge_resolved_at=?,hedge_terminal_reason=?
+      WHERE hedge_batch_id=? AND hedge_status='pending'`).run(t, reason, batchId);
   }
 
   listPendingCandidateFills(): CandidatePendingFill[] {

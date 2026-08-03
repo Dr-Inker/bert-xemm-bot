@@ -42,6 +42,9 @@ export async function measureCandidateSnapshot(i: CandidateSnapshotInput): Promi
   if (!bid || !ask) throw new Error('complete Kraken book required');
   const references = new Map<string, CandidateReference>();
   const uniqueSizes = [...new Map(i.sizesBert.map(size => [size.toString(), size])).values()];
+  // TTL begins before the first constituent quote, not after the serial
+  // recomputation completes. This makes the oldest route the age bound.
+  const asOf = (i.now ?? (() => new Date()))();
   for (const sizeBert of uniqueSizes) {
     const executableInput = {
       sizeBert,
@@ -65,7 +68,7 @@ export async function measureCandidateSnapshot(i: CandidateSnapshotInput): Promi
   }
   const krakenMid = bid.plus(ask).div(2);
   return {
-    asOf: (i.now ?? (() => new Date()))(),
+    asOf,
     raydiumMidUsd: i.raydiumMidUsd,
     solUsd: i.solUsd,
     krakenBid: bid,

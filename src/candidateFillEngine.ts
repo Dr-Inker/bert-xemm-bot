@@ -58,8 +58,10 @@ export interface CandidateFillRecord {
   stressFailureReserveUsd: string;
   stressTransactionCostUsd: string;
   stressNetPnlUsd: string;
-  hedgeStatus: 'pending' | 'simulated';
-  economicsSource: 'placement_reference' | 'fill_time_executable';
+  hedgeStatus: 'pending' | 'simulated' | 'abandoned';
+  economicsSource: 'placement_reference' | 'fill_time_executable' | 'restart_recovered_executable';
+  hedgeResolvedAt: string | null;
+  hedgeTerminalReason: string | null;
   t: string;
 }
 
@@ -94,6 +96,7 @@ export interface CandidateFillEngineOpts {
   drift5sBps: number;
   drift30sBps: number;
   driftResumeStableSec: number;
+  maxPendingHedgeAgeMs: number;
   maxActivePerSideBert: number;
   normalFriction: CandidateFriction;
   stressFriction: CandidateFriction;
@@ -101,6 +104,7 @@ export interface CandidateFillEngineOpts {
     upsertCandidateOrder(order: CandidateOrder): void;
     closeCandidateOrder(id: string, remainingBert: string, t: string, reason: string): void;
     upsertCandidateFill(fill: CandidateFillRecord): void;
+    abandonCandidateHedgeBatch(batchId: string, t: string, reason: string): void;
     syncCandidateGatePeriods(gates: Array<{ gate: string; detailJson: string }>, t: string): void;
   };
   hedgeBatch: (side: Side, sizeBert: Decimal) => Promise<CandidateHedgeResult>;
@@ -122,11 +126,13 @@ interface PendingHedge {
   side: Side;
   allocations: Allocation[];
   inFlight: boolean;
+  createdAtMs: number;
+  recoveredAfterRestart: boolean;
 }
 
 interface DriftState {
   pulled: boolean;
-  lastAdverseMoveAtMs: number | null;
+  metricsStableSinceMs: number | null;
 }
 
 interface HistoryEntry {
@@ -177,8 +183,8 @@ export class CandidateFillEngine {
   private batchSeq = 0;
   private fillSeq = 0;
   private drift: Record<Side, DriftState> = {
-    buy: { pulled: false, lastAdverseMoveAtMs: null },
-    sell: { pulled: false, lastAdverseMoveAtMs: null },
+    buy: { pulled: false, metricsStableSinceMs: null },
+    sell: { pulled: false, metricsStableSinceMs: null },
   };
 
   constructor(private opts: CandidateFillEngineOpts) {}
@@ -190,7 +196,7 @@ export class CandidateFillEngine {
   hasPendingHedge(): boolean { return this.pendingHedges.length > 0; }
 
   /** Rehydrate fill batches whose executable hedge simulation was interrupted by restart. */
-  restorePendingFills(fills: CandidatePendingFill[]): void {
+  restorePendingFills(fills: CandidatePendingFill[], now = new Date()): void {
     const groups = new Map<string, CandidatePendingFill[]>();
     for (const fill of fills) {
       const key = `${fill.hedgeBatchId}:${fill.side}`;
@@ -201,6 +207,11 @@ export class CandidateFillEngine {
     for (const group of groups.values()) {
       const first = group[0];
       if (!first) continue;
+      const createdAtMs = Math.min(...group.map(fill => Date.parse(fill.t)));
+      if (now.getTime() - createdAtMs > this.opts.maxPendingHedgeAgeMs) {
+        this.opts.store.abandonCandidateHedgeBatch(first.hedgeBatchId, now.toISOString(), 'restart_pending_expired');
+        continue;
+      }
       const allocations: Allocation[] = group.map(fill => ({
         fillId: fill.candidateFillId,
         order: {
@@ -226,6 +237,8 @@ export class CandidateFillEngine {
         side: first.side,
         allocations,
         inFlight: false,
+        createdAtMs,
+        recoveredAfterRestart: true,
       });
     }
   }
@@ -280,7 +293,7 @@ export class CandidateFillEngine {
    * Allocate every public trade once across the price-priority ladder. State is
    * cancelled synchronously before the simulated hedge promise is started.
    */
-  onTradeBatch(trades: PublicTrade[]): Promise<void> {
+  onTradeBatch(trades: PublicTrade[], now = new Date()): Promise<void> {
     const allocations: Allocation[] = [];
     for (const trade of trades) {
       if (this.seenTradeIds.has(trade.tradeId)) continue;
@@ -332,20 +345,34 @@ export class CandidateFillEngine {
     for (const side of ['buy', 'sell'] as const) {
       const sideAllocations = allocations.filter(allocation => allocation.order.side === side);
       if (sideAllocations.length === 0) continue;
-      this.writeFills(hedgeBatchId, sideAllocations, null);
-      this.pendingHedges.push({ hedgeBatchId, side, allocations: sideAllocations, inFlight: false });
+      this.writeFills(hedgeBatchId, sideAllocations, null, false, null);
+      this.pendingHedges.push({
+        hedgeBatchId,
+        side,
+        allocations: sideAllocations,
+        inFlight: false,
+        createdAtMs: now.getTime(),
+        recoveredAfterRestart: false,
+      });
     }
-    return this.retryPendingHedges();
+    return this.retryPendingHedges(now);
   }
 
-  async retryPendingHedges(): Promise<void> {
+  async retryPendingHedges(now = new Date()): Promise<void> {
     for (const pending of [...this.pendingHedges]) {
+      if (now.getTime() - pending.createdAtMs > this.opts.maxPendingHedgeAgeMs) {
+        this.opts.store.abandonCandidateHedgeBatch(pending.hedgeBatchId, now.toISOString(), 'pending_hedge_expired');
+        this.pendingHedges = this.pendingHedges.filter(item => item !== pending);
+        continue;
+      }
       if (pending.inFlight) continue;
       pending.inFlight = true;
       const total = pending.allocations.reduce((sum, allocation) => sum.plus(allocation.volume), new Decimal(0));
       try {
         const hedge = await this.opts.hedgeBatch(pending.side, total);
-        this.writeFills(pending.hedgeBatchId, pending.allocations, hedge);
+        // A hung attempt may have been terminally abandoned by a later tick.
+        if (!this.pendingHedges.includes(pending)) continue;
+        this.writeFills(pending.hedgeBatchId, pending.allocations, hedge, pending.recoveredAfterRestart, now);
         this.pendingHedges = this.pendingHedges.filter(item => item !== pending);
       } catch {
         pending.inFlight = false;
@@ -408,7 +435,13 @@ export class CandidateFillEngine {
     this.opts.store.upsertCandidateOrder(order);
   }
 
-  private writeFills(batchId: string, allocations: Allocation[], hedge: CandidateHedgeResult | null): void {
+  private writeFills(
+    batchId: string,
+    allocations: Allocation[],
+    hedge: CandidateHedgeResult | null,
+    recoveredAfterRestart: boolean,
+    resolvedAt: Date | null,
+  ): void {
     const totalNotional = allocations.reduce(
       (sum, allocation) => sum.plus(new Decimal(allocation.order.price).mul(allocation.volume)),
       new Decimal(0),
@@ -445,7 +478,11 @@ export class CandidateFillEngine {
         stressTransactionCostUsd: stress.transaction.toString(),
         stressNetPnlUsd: stress.net.toString(),
         hedgeStatus: hedge ? 'simulated' : 'pending',
-        economicsSource: hedge ? 'fill_time_executable' : 'placement_reference',
+        economicsSource: hedge
+          ? recoveredAfterRestart ? 'restart_recovered_executable' : 'fill_time_executable'
+          : 'placement_reference',
+        hedgeResolvedAt: hedge ? (resolvedAt ?? new Date()).toISOString() : null,
+        hedgeTerminalReason: null,
         t: allocation.trade.t.toISOString(),
       });
     }
@@ -496,22 +533,24 @@ export class CandidateFillEngine {
     for (const [size, reference] of snapshot.references) {
       references.set(size, { sell: reference.executableSellPriceUsd, buy: reference.executableBuyPriceUsd });
     }
-    const previous = this.history[this.history.length - 1];
     this.history.push({ atMs, references });
     this.history = this.history.filter(entry => entry.atMs >= atMs - 120_000);
     for (const side of ['buy', 'sell'] as const) {
       const state = this.drift[side];
       const triggered = this.driftTriggered(side, this.history[this.history.length - 1]!);
-      const adverseStep = previous ? hasAdverseStep(side, previous, this.history[this.history.length - 1]!) : false;
       if (!state.pulled && triggered) {
         state.pulled = true;
-        state.lastAdverseMoveAtMs = atMs;
+        state.metricsStableSinceMs = null;
       } else if (state.pulled) {
-        if (adverseStep) state.lastAdverseMoveAtMs = atMs;
-        const stableFrom = state.lastAdverseMoveAtMs ?? atMs;
-        if (atMs - stableFrom >= this.opts.driftResumeStableSec * 1000) {
+        if (triggered) {
+          state.metricsStableSinceMs = null;
+        } else {
+          state.metricsStableSinceMs ??= atMs;
+        }
+        if (state.metricsStableSinceMs !== null
+          && atMs - state.metricsStableSinceMs >= this.opts.driftResumeStableSec * 1000) {
           state.pulled = false;
-          state.lastAdverseMoveAtMs = null;
+          state.metricsStableSinceMs = null;
         }
       }
     }
@@ -593,15 +632,6 @@ function priceTimePriority(a: CandidateOrder, b: CandidateOrder): number {
   const priceCmp = new Decimal(a.price).cmp(b.price);
   if (priceCmp !== 0) return a.side === 'buy' ? -priceCmp : priceCmp;
   return a.placedAt.localeCompare(b.placedAt);
-}
-
-function hasAdverseStep(side: Side, previous: HistoryEntry, current: HistoryEntry): boolean {
-  for (const [size, currentRef] of current.references) {
-    const oldRef = previous.references.get(size);
-    if (!oldRef) continue;
-    if (side === 'buy' ? currentRef.sell.lt(oldRef.sell) : currentRef.buy.gt(oldRef.buy)) return true;
-  }
-  return false;
 }
 
 function latestTradeTime(allocations: Allocation[]): Date {

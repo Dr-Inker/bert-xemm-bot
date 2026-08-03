@@ -26,6 +26,7 @@ function harness(overrides: Partial<CandidateFillEngineOpts> = {}) {
     upsertCandidateOrder: vi.fn(),
     closeCandidateOrder: vi.fn(),
     upsertCandidateFill: vi.fn(),
+    abandonCandidateHedgeBatch: vi.fn(),
     syncCandidateGatePeriods: vi.fn(),
   };
   const opts: CandidateFillEngineOpts = {
@@ -39,6 +40,7 @@ function harness(overrides: Partial<CandidateFillEngineOpts> = {}) {
     drift5sBps: 35,
     drift30sBps: 75,
     driftResumeStableSec: 30,
+    maxPendingHedgeAgeMs: 120_000,
     maxActivePerSideBert: 200,
     normalFriction: normal,
     stressFriction: stress,
@@ -88,7 +90,7 @@ describe('CandidateFillEngine', () => {
       price: new Decimal('0.09'),
       volume: new Decimal(150),
       t: new Date(t.getTime() + 100),
-    }]);
+    }], t);
 
     const finalFills = store.upsertCandidateFill.mock.calls
       .map(call => call[0])
@@ -115,7 +117,7 @@ describe('CandidateFillEngine', () => {
     expect(store.closeCandidateOrder).toHaveBeenCalledWith(expect.any(String), expect.any(String), expect.any(String), 'ttl_stale');
   });
 
-  it('pulls only the adverse side at the 5s drift threshold and resumes after 30s stable', () => {
+  it('resumes after drift metrics stay below both thresholds for 30s despite normal adverse ticks', () => {
     const { engine, store } = harness({ ladder: [{ sizeBert: 100, distanceBps: 400 }], maxActivePerSideBert: 100 });
     const initial = snapshot('2026-08-03T00:00:00.000Z');
     engine.updateQuotes(initial, initial.asOf);
@@ -125,12 +127,41 @@ describe('CandidateFillEngine', () => {
     expect(engine.activeOrders().map(order => order.side)).toEqual(['sell']);
     expect(store.closeCandidateOrder).toHaveBeenCalledWith(expect.any(String), expect.any(String), expect.any(String), 'drift_pull');
 
-    const stable29 = snapshot('2026-08-03T00:00:34.000Z', '0.0996', '0.1');
-    engine.updateQuotes(stable29, stable29.asOf);
+    const metricStable = snapshot('2026-08-03T00:00:10.001Z', '0.0996', '0.1');
+    engine.updateQuotes(metricStable, metricStable.asOf);
     expect(engine.activeOrders().map(order => order.side)).toEqual(['sell']);
-    const stable30 = snapshot('2026-08-03T00:00:35.000Z', '0.0996', '0.1');
+    for (const [seconds, sell] of [[15, '0.09959'], [20, '0.09961'], [25, '0.09958'], [30, '0.0996'], [35, '0.09957'], [39, '0.09959']] as const) {
+      const noisy = snapshot(`2026-08-03T00:00:${String(seconds).padStart(2, '0')}.001Z`, sell, '0.1');
+      engine.updateQuotes(noisy, noisy.asOf);
+      expect(engine.activeOrders().map(order => order.side)).toEqual(['sell']);
+    }
+    const stable30 = snapshot('2026-08-03T00:00:40.001Z', '0.09958', '0.1');
     engine.updateQuotes(stable30, stable30.asOf);
     expect(engine.activeOrders().map(order => order.side).sort()).toEqual(['buy', 'sell']);
+  });
+
+  it('re-estimates queue ahead from the current book when a price change loses priority', async () => {
+    const { engine, store } = harness({ ladder: [{ sizeBert: 100, distanceBps: 400 }], maxActivePerSideBert: 100 });
+    const t = new Date('2026-08-03T00:00:00.000Z');
+    const initial = snapshot(t.toISOString());
+    initial.book.bids = [{ price: new Decimal('0.099'), volume: new Decimal(100) }];
+    engine.updateQuotes(initial, t);
+    const oldBuy = engine.activeOrders().find(order => order.side === 'buy')!;
+    expect(oldBuy.queueAheadRemainingBert).toBe('100');
+
+    await engine.onTradeBatch([{
+      tradeId: 21, side: 'sell', price: new Decimal('0.09'), volume: new Decimal(100), t,
+    }], t);
+    expect(engine.activeOrders().find(order => order.side === 'buy')?.queueAheadRemainingBert).toBe('0');
+
+    const repriced = snapshot('2026-08-03T00:00:01.000Z', '0.1002', '0.1');
+    repriced.book.bids = [{ price: new Decimal('0.099'), volume: new Decimal(250) }];
+    engine.updateQuotes(repriced, repriced.asOf);
+    const newBuy = engine.activeOrders().find(order => order.side === 'buy')!;
+    expect(newBuy.candidateOrderId).not.toBe(oldBuy.candidateOrderId);
+    expect(newBuy.queueAheadAtPlacementBert).toBe('250');
+    expect(newBuy.queueAheadRemainingBert).toBe('250');
+    expect(store.closeCandidateOrder).toHaveBeenCalledWith(oldBuy.candidateOrderId, '100', expect.any(String), 'reprice');
   });
 
   it('cancels every candidate order synchronously on the first partial fill', () => {
@@ -144,7 +175,7 @@ describe('CandidateFillEngine', () => {
       price: new Decimal('0.09'),
       volume: new Decimal(10),
       t: new Date(t.getTime() + 100),
-    }]);
+    }], t);
 
     expect(engine.activeOrders()).toHaveLength(0);
     expect(engine.hasPendingHedge()).toBe(true);
@@ -162,5 +193,47 @@ describe('CandidateFillEngine', () => {
     expect(normalEdge.passes).toBe(true);
     expect(stressEdge.netEdgeBps.toNumber()).toBeLessThan(75);
     expect(stressEdge.passes).toBe(false);
+  });
+
+  it('abandons stale restart fills without fabricating current-price economics', () => {
+    const { engine, store, opts } = harness();
+    const now = new Date('2026-08-03T00:03:00.001Z');
+    engine.restorePendingFills([{
+      candidateFillId: 'cf-old', candidateOrderId: 'co-old', krakenTradeId: 31,
+      hedgeBatchId: 'ch-old', side: 'buy', distanceBps: '400', fillPriceUsd: '0.096',
+      volumeBert: '50', orderRemainingBert: '50', referencePriceUsd: '0.1',
+      referenceImpactBps: '2', t: '2026-08-03T00:00:00.000Z',
+    }], now);
+
+    expect(engine.hasPendingHedge()).toBe(false);
+    expect(opts.hedgeBatch).not.toHaveBeenCalled();
+    expect(store.abandonCandidateHedgeBatch).toHaveBeenCalledWith('ch-old', now.toISOString(), 'restart_pending_expired');
+  });
+
+  it('labels a timely restart hedge distinctly and expires a permanently failing live hedge', async () => {
+    const recovered = harness();
+    const recoveryNow = new Date('2026-08-03T00:01:00.000Z');
+    recovered.engine.restorePendingFills([{
+      candidateFillId: 'cf-recent', candidateOrderId: 'co-recent', krakenTradeId: 32,
+      hedgeBatchId: 'ch-recent', side: 'buy', distanceBps: '400', fillPriceUsd: '0.096',
+      volumeBert: '50', orderRemainingBert: '50', referencePriceUsd: '0.1',
+      referenceImpactBps: '2', t: '2026-08-03T00:00:30.000Z',
+    }], recoveryNow);
+    await recovered.engine.retryPendingHedges(recoveryNow);
+    expect(recovered.store.upsertCandidateFill.mock.calls.at(-1)?.[0]).toMatchObject({
+      hedgeStatus: 'simulated', economicsSource: 'restart_recovered_executable',
+    });
+
+    const failing = harness({ hedgeBatch: vi.fn().mockRejectedValue(new Error('unavailable')) });
+    const t = new Date('2026-08-03T01:00:00.000Z');
+    failing.engine.updateQuotes(snapshot(t.toISOString()), t);
+    await failing.engine.onTradeBatch([{
+      tradeId: 33, side: 'sell', price: new Decimal('0.09'), volume: new Decimal(10), t,
+    }], t);
+    expect(failing.engine.hasPendingHedge()).toBe(true);
+    const expired = new Date(t.getTime() + 120_001);
+    await failing.engine.retryPendingHedges(expired);
+    expect(failing.engine.hasPendingHedge()).toBe(false);
+    expect(failing.store.abandonCandidateHedgeBatch).toHaveBeenCalledWith(expect.any(String), expired.toISOString(), 'pending_hedge_expired');
   });
 });

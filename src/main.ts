@@ -122,7 +122,9 @@ async function main(): Promise<void> {
   const bookCache = new BookCache(cfg.kraken.pair, logger);
   bookCache.run(cex, cfg.kraken.pair, 10).catch(e => logger.error({ err: e }, 'bookCache run crashed'));
   const publicTrades = new KrakenPublicTrades(cfg.kraken.cliBinaryPath, cfg.kraken.pair, logger);
-  const quoteLimiter = new JupiterQuoteRateLimiter(cfg.maxRpcCallsPerSec);
+  // Candidate-only FIFO. The existing observer/paper lane deliberately keeps
+  // its pre-shadow direct Jupiter timing so evidence remains baseline-comparable.
+  const candidateQuoteLimiter = new JupiterQuoteRateLimiter(cfg.maxRpcCallsPerSec);
   store.cancelAllOpenPaperOrders(new Date().toISOString(), 'process_restart');
   store.cancelAllOpenCandidateOrders(new Date().toISOString(), 'process_restart');
   const paper = new PaperFillEngine({
@@ -139,7 +141,6 @@ async function main(): Promise<void> {
         sizeBert: size, krakenBid: fillPrice, krakenAsk: fillPrice,
         raydiumMidUsd: mid.mid, solUsd: mid.solUsd, makerFeeBps: fee.makerBps,
         jupiterBaseUrl: cfg.jupiter.baseUrl, slippageBps: cfg.jupiter.maxSlippageBps,
-        quote: quoteLimiter.quote,
       });
       return {
         dexPriceUsd: side === 'buy' ? e.dexSellPriceUsd : e.dexBuyPriceUsd,
@@ -160,6 +161,7 @@ async function main(): Promise<void> {
         drift5sBps: cfg.candidate.drift5sBps,
         drift30sBps: cfg.candidate.drift30sBps,
         driftResumeStableSec: cfg.candidate.driftResumeStableSec,
+        maxPendingHedgeAgeMs: cfg.candidate.maxPendingHedgeAgeMs,
         maxActivePerSideBert: cfg.candidate.maxActivePerSideBert,
         normalFriction: cfg.candidate.normalFriction,
         stressFriction: cfg.candidate.stressFriction,
@@ -172,7 +174,7 @@ async function main(): Promise<void> {
             solUsd: mid.solUsd,
             jupiterBaseUrl: cfg.jupiter.baseUrl,
             slippageBps: cfg.jupiter.maxSlippageBps,
-            quote: quoteLimiter.quote,
+            quote: candidateQuoteLimiter.quote,
           };
           const executable = side === 'buy'
             ? await measureExecutableSell(input)
@@ -182,10 +184,12 @@ async function main(): Promise<void> {
       })
     : null;
   candidate?.restorePendingFills(store.listPendingCandidateFills());
-  publicTrades.onBatch(trades => {
-    store.insertPublicTrades(trades);
-    return candidate?.onTradeBatch(trades);
-  });
+  if (candidate) {
+    publicTrades.onBatch(trades => {
+      store.insertPublicTrades(trades);
+      return candidate.onTradeBatch(trades);
+    });
+  }
   if (cfg.paper.enabled) publicTrades.onTrade(t => paper.onTrade(t));
   if (cfg.mode === 'observer' && (cfg.paper.enabled || candidate !== null)) {
     publicTrades.run().catch(e => logger.error({ err: e }, 'public trades stream crashed'));
@@ -364,7 +368,6 @@ async function main(): Promise<void> {
           sizeBert, krakenBid: bid, krakenAsk: ask, raydiumMidUsd: mid.mid,
           solUsd: mid.solUsd, makerFeeBps: fee.makerBps,
           jupiterBaseUrl: cfg.jupiter.baseUrl, slippageBps: cfg.jupiter.maxSlippageBps,
-          quote: quoteLimiter.quote,
         });
         store.insertObserverSample({
           t: new Date().toISOString(), sizeBert: sizeBert.toString(),
@@ -416,7 +419,7 @@ async function main(): Promise<void> {
         book,
         jupiterBaseUrl: cfg.jupiter.baseUrl,
         slippageBps: cfg.jupiter.maxSlippageBps,
-        quote: quoteLimiter.quote,
+        quote: candidateQuoteLimiter.quote,
       });
       candidateSnapshot = snapshot;
       candidate.recordRefreshSuccess();

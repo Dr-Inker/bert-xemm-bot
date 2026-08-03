@@ -60,4 +60,29 @@ describe('candidate quote sampling', () => {
 
     expect(starts).toEqual([0, 500, 1000]);
   });
+
+  it('starts snapshot TTL before the first constituent quote is constructed', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const quote = vi.fn(async (args: QuoteArgs) => {
+      vi.setSystemTime(Date.now() + 400);
+      return { ...response(args.amount), inAmount: args.amount };
+    });
+    const sampled = await measureCandidateSnapshot({
+      sizesBert: [new Decimal(1000), new Decimal(500)],
+      raydiumMidUsd: new Decimal('0.1'), solUsd: new Decimal(100),
+      book: {
+        pair: 'BERT/USD', bids: [{ price: new Decimal('0.099'), volume: new Decimal(1) }],
+        asks: [{ price: new Decimal('0.101'), volume: new Decimal(1) }], t: new Date(0),
+      },
+      jupiterBaseUrl: 'https://example.test', slippageBps: 50, quote,
+      now: () => new Date(Date.now()),
+    });
+
+    const completedAtMs = Date.now();
+    expect(completedAtMs).toBe(1600);
+    expect(sampled.asOf.getTime()).toBe(0);
+    expect(3100 - sampled.asOf.getTime()).toBeGreaterThan(3000);
+    expect(3100 - completedAtMs).toBeLessThan(3000);
+  });
 });

@@ -93,9 +93,11 @@ describe('StateStore', () => {
       normalMakerFeeUsd: '0.011', normalLatencyCostUsd: '0.01', normalFailureReserveUsd: '0.005',
       normalTransactionCostUsd: '0.02', normalNetPnlUsd: '0.1465',
       stressMakerFeeUsd: '0.012', stressLatencyCostUsd: '0.02', stressFailureReserveUsd: '0.01',
-      stressTransactionCostUsd: '0.04', stressNetPnlUsd: '0.1105', hedgeStatus: 'simulated',
-      economicsSource: 'fill_time_executable', t: t.toISOString(),
+      stressTransactionCostUsd: '0.04', stressNetPnlUsd: '0.1105', hedgeStatus: 'pending',
+      economicsSource: 'placement_reference', hedgeResolvedAt: null, hedgeTerminalReason: null, t: t.toISOString(),
     });
+    expect(store.listPendingCandidateFills()).toHaveLength(1);
+    store.abandonCandidateHedgeBatch('ch1', new Date(t.getTime() + 500).toISOString(), 'pending_hedge_expired');
     store.syncCandidateGatePeriods([{ gate: 'route_gate_buy_500', detailJson: '{"deviationBps":"80"}' }], t.toISOString());
     store.syncCandidateGatePeriods([], new Date(t.getTime() + 1000).toISOString());
 
@@ -105,7 +107,21 @@ describe('StateStore', () => {
       .toMatchObject({ remaining_bert: '450', queue_ahead_at_placement_bert: '100', close_reason: 'cancel_on_fill' });
     expect((db.prepare('SELECT normal_net_pnl_usd,stress_net_pnl_usd FROM candidate_fills').get() as Record<string, string>))
       .toEqual({ normal_net_pnl_usd: '0.1465', stress_net_pnl_usd: '0.1105' });
+    expect((db.prepare('SELECT hedge_status,hedge_terminal_reason FROM candidate_fills').get() as Record<string, string>))
+      .toEqual({ hedge_status: 'abandoned', hedge_terminal_reason: 'pending_hedge_expired' });
     expect((db.prepare('SELECT ended_at FROM candidate_gate_periods').get() as { ended_at: string }).ended_at).not.toBeNull();
+  });
+
+  it('enforces foreign keys and installs dashboard query indexes', () => {
+    const db = (store as unknown as { db: import('better-sqlite3').Database }).db;
+    expect(db.pragma('foreign_keys', { simple: true })).toBe(1);
+    expect(() => db.prepare(`INSERT INTO fills
+      (fill_id,order_cl_ord_id,side,price,volume,fee,t) VALUES ('orphan','missing','buy','1','1','0','2026-08-03T00:00:00Z')`).run())
+      .toThrow(/FOREIGN KEY/);
+    const orderIndexes = db.pragma('index_list(candidate_orders)') as Array<{ name: string }>;
+    const gateIndexes = db.pragma('index_list(candidate_gate_periods)') as Array<{ name: string }>;
+    expect(orderIndexes.map(index => index.name)).toContain('idx_candidate_orders_updated_at');
+    expect(gateIndexes.map(index => index.name)).toContain('idx_candidate_gate_started_at');
   });
 
   it('withTransaction rolls back on throw', () => {

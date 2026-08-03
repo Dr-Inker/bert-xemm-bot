@@ -10,7 +10,7 @@ const CandidateFrictionSchema = z.object({
 });
 
 const CandidateConfigSchema = z.object({
-  enabled: z.boolean().default(true),
+  enabled: z.boolean().default(false),
   ladder: z.array(z.object({
     sizeBert: z.number().positive(),
     distanceBps: z.number().positive(),
@@ -29,6 +29,7 @@ const CandidateConfigSchema = z.object({
   drift5sBps: z.number().nonnegative().default(35),
   drift30sBps: z.number().nonnegative().default(75),
   driftResumeStableSec: z.number().int().positive().default(30),
+  maxPendingHedgeAgeMs: z.number().int().positive().default(120_000),
   maxActivePerSideBert: z.number().positive().default(2000),
   normalFriction: CandidateFrictionSchema.default({
     makerFeeBps: 23,

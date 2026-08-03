@@ -39,13 +39,6 @@ export class KrakenPublicTrades {
             trades.push({ tradeId: d.trade_id, side, price: new Decimal(d.price), volume: new Decimal(d.qty), t: new Date(d.timestamp) });
           }
           if (trades.length === 0) continue;
-          for (const fn of this.batchListeners) {
-            try {
-              void Promise.resolve(fn(trades)).catch(err => this.logger.warn({ err }, 'public trades batch listener failed'));
-            } catch (err) {
-              this.logger.warn({ err }, 'public trades batch listener failed');
-            }
-          }
           for (const trade of trades) {
             for (const fn of this.listeners) {
               try {
@@ -54,6 +47,21 @@ export class KrakenPublicTrades {
                 this.logger.warn({ err }, 'public trade listener failed');
               }
             }
+          }
+          // Comparison-lane listeners are invoked first. Candidate persistence
+          // and allocation are deferred off the hot delivery stack so a sync
+          // WAL transaction cannot delay paper trade notification.
+          if (this.batchListeners.size > 0) {
+            const batch = [...trades];
+            queueMicrotask(() => {
+              for (const fn of this.batchListeners) {
+                try {
+                  void Promise.resolve(fn(batch)).catch(err => this.logger.warn({ err }, 'public trades batch listener failed'));
+                } catch (err) {
+                  this.logger.warn({ err }, 'public trades batch listener failed');
+                }
+              }
+            });
           }
         }
       } catch (err) {

@@ -17,7 +17,8 @@ interface RawPaperFill {
 interface RawCandidateFill {
   candidate_fill_id: string; side: string; distance_bps: string; volume_bert: string;
   gross_pnl_usd: string; normal_net_pnl_usd: string; stress_net_pnl_usd: string;
-  hedge_status: string; economics_source: string; t: string;
+  hedge_status: string; economics_source: string; hedge_resolved_at: string | null;
+  hedge_terminal_reason: string | null; t: string;
 }
 interface RawGatePeriod { gate: string; started_at: string; ended_at: string | null }
 interface RawCloseReason { close_reason: string; n: number }
@@ -34,7 +35,8 @@ const paperRows = db.prepare(`SELECT paper_fill_id,side,volume_bert,gross_pnl_us
   FROM paper_fills WHERE t >= ? ORDER BY t ASC`).all(since) as RawPaperFill[];
 const openPaperOrders = (db.prepare(`SELECT COUNT(*) n FROM paper_orders WHERE status='open'`).get() as { n: number }).n;
 const candidateRows = db.prepare(`SELECT candidate_fill_id,side,distance_bps,volume_bert,gross_pnl_usd,
-  normal_net_pnl_usd,stress_net_pnl_usd,hedge_status,economics_source,t
+  normal_net_pnl_usd,stress_net_pnl_usd,hedge_status,economics_source,
+  hedge_resolved_at,hedge_terminal_reason,t
   FROM candidate_fills WHERE t >= ? ORDER BY t ASC`).all(since) as RawCandidateFill[];
 const openCandidateOrders = (db.prepare(`SELECT COUNT(*) n FROM candidate_orders WHERE status='open'`).get() as { n: number }).n;
 const publicTrades24h = (db.prepare(`SELECT COUNT(*) n FROM public_trades WHERE t >= ?`).get(since) as { n: number }).n;
@@ -89,12 +91,15 @@ const candidateFills = candidateRows.map(r => ({
   stressNetPnlUsd: Number(r.stress_net_pnl_usd),
   hedgeStatus: r.hedge_status,
   economicsSource: r.economics_source,
+  hedgeResolvedAt: r.hedge_resolved_at,
+  hedgeTerminalReason: r.hedge_terminal_reason,
   t: r.t,
 }));
 const simulatedCandidateFills = candidateFills.filter(fill => fill.hedgeStatus === 'simulated');
+const eligibleCandidateFills = simulatedCandidateFills.filter(fill => fill.economicsSource === 'fill_time_executable');
 const candidateSum = (key: 'grossPnlUsd' | 'normalNetPnlUsd' | 'stressNetPnlUsd'): number =>
-  simulatedCandidateFills.reduce((total, fill) => total + fill[key], 0);
-const candidateDrawdowns = dualDrawdown(simulatedCandidateFills);
+  eligibleCandidateFills.reduce((total, fill) => total + fill[key], 0);
+const candidateDrawdowns = dualDrawdown(eligibleCandidateFills);
 const nowMs = Date.now();
 const gateSummary = [...new Set(gateRows.map(row => row.gate))].sort().map(gate => {
   const periods = gateRows.filter(row => row.gate === gate);
@@ -134,7 +139,10 @@ const payload = {
     openOrders: openCandidateOrders,
     fills24h: candidateFills.length,
     simulatedFills24h: simulatedCandidateFills.length,
-    pendingFills24h: candidateFills.length - simulatedCandidateFills.length,
+    eligibleFills24h: eligibleCandidateFills.length,
+    restartRecoveredFills24h: simulatedCandidateFills.filter(fill => fill.economicsSource === 'restart_recovered_executable').length,
+    pendingFills24h: candidateFills.filter(fill => fill.hedgeStatus === 'pending').length,
+    abandonedFills24h: candidateFills.filter(fill => fill.hedgeStatus === 'abandoned').length,
     grossPnlUsd24h: candidateSum('grossPnlUsd'),
     normalNetPnlUsd24h: candidateSum('normalNetPnlUsd'),
     stressNetPnlUsd24h: candidateSum('stressNetPnlUsd'),
