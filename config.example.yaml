@@ -57,11 +57,20 @@ paper:
   transactionCostUsd: 0.02
 
 # Observer-only shadow-v2 lane. It is opt-in: existing deployments remain on
-# the comparison lane until enabled explicitly. Candidate Jupiter calls use a
-# dedicated maxRpcCallsPerSec limiter; existing observer/paper calls retain
-# their pre-shadow timing and do not share the candidate FIFO.
+# the comparison lane until enabled explicitly. The candidate uses a keyed,
+# independently admitted Jupiter path; existing observer/paper calls retain
+# their pre-shadow endpoint, cadence, and concurrency.
 candidate:
   enabled: false
+  jupiterBaseUrl: https://api.jup.ag/swap/v1
+  # Name of the environment variable containing the key. Never put the key in YAML.
+  apiKeyEnv: JUPITER_API_KEY
+  # Four calls are reserved atomically for the default two-size snapshot.
+  maxQuoteCallsPerSec: 6
+  disableOnProviderRateLimit: true
+  providerRateLimitConsecutiveThreshold: 3
+  providerRateLimitDefaultCooldownMs: 60000
+  baselineWatchdogMs: 45000
   ladder:
     - { sizeBert: 1000, distanceBps: 175 }
     - { sizeBert: 500, distanceBps: 400 }
@@ -131,10 +140,8 @@ watchdog:
 # Oracle: kill if two price sources diverge by more than this (bps).
 oracleDivergenceBps: 200
 
-# Solana-side operational ceiling. Shadow v2 also uses this value as its own
-# candidate-only Jupiter quote start-rate budget. It does not throttle the
-# baseline observer/paper lane, so total Jupiter demand is the candidate budget
-# plus whatever baseline sampling or fill hedges are active at that instant.
+# Solana-side operational ceiling. Candidate Jupiter admission is configured
+# separately under candidate.maxQuoteCallsPerSec.
 maxRpcCallsPerSec: 5
 
 paths:

@@ -9,8 +9,15 @@ const CandidateFrictionSchema = z.object({
   transactionCostUsd: z.number().nonnegative(),
 });
 
-const CandidateConfigSchema = z.object({
+export const CandidateConfigSchema = z.object({
   enabled: z.boolean().default(false),
+  jupiterBaseUrl: z.string().url().default('https://api.jup.ag/swap/v1'),
+  apiKeyEnv: z.string().min(1).default('JUPITER_API_KEY'),
+  maxQuoteCallsPerSec: z.number().int().positive().default(6),
+  disableOnProviderRateLimit: z.boolean().default(true),
+  providerRateLimitConsecutiveThreshold: z.number().int().positive().default(3),
+  providerRateLimitDefaultCooldownMs: z.number().int().positive().default(60_000),
+  baselineWatchdogMs: z.number().int().positive().default(45_000),
   ladder: z.array(z.object({
     sizeBert: z.number().positive(),
     distanceBps: z.number().positive(),
@@ -129,6 +136,7 @@ export const BotConfigSchema = z.object({
 });
 
 export type BotConfig = z.infer<typeof BotConfigSchema>;
+export type CandidateConfig = BotConfig['candidate'];
 
 export function loadConfig(path: string): BotConfig {
   const raw = readFileSync(path, 'utf8');

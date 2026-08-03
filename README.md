@@ -71,9 +71,18 @@ paper:
   latencyPenaltyBps: 20
   failedHedgeReserveBps: 10
   transactionCostUsd: 0.02
+
+candidate:
+  enabled: false
+  jupiterBaseUrl: https://api.jup.ag/swap/v1
+  apiKeyEnv: JUPITER_API_KEY
+  maxQuoteCallsPerSec: 6
+  baselineWatchdogMs: 45000
 ```
 
-Jupiter's public base URL is `https://lite-api.jup.ag/swap/v1`.
+The baseline retains its configured public Jupiter URL. The candidate lane is
+disabled by default and refuses to start unless its configured API-key
+environment variable is non-empty; candidate credentials are never exported.
 
 ## Data
 
@@ -84,6 +93,8 @@ Key tables:
 - `observer_samples`: executable two-way prices, impact, fee, book age, trust and edge by size.
 - `paper_orders`: simulated price, queue ahead, lifecycle and cancellation reason.
 - `paper_fills`: fill/hedge prices plus gross P&L and each friction deduction.
+- `candidate_quote_attempts`: keyed-provider status, construction time, 429s,
+  capacity skips, baseline sample age, and strategy fingerprint.
 - `basis_samples`: legacy/reference top-of-book basis observations.
 
 Dashboard export:

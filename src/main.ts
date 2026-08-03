@@ -21,10 +21,16 @@ import { PaperFillEngine, type PaperQuoteCandidate } from './paperFillEngine.js'
 import { KrakenPublicTrades } from './venues/krakenPublicTrades.js';
 import { CandidateFillEngine } from './candidateFillEngine.js';
 import {
-  JupiterQuoteRateLimiter,
   measureCandidateSnapshot,
   type CandidateEconomicSnapshot,
 } from './candidateQuoteSampler.js';
+import {
+  CandidateCallAdmission,
+  CandidateLaneGuard,
+  candidateStrategyFingerprint,
+  resolveCandidateApiKey,
+} from './candidateRuntime.js';
+import { jupiterQuote, JupiterQuoteHttpError } from './venues/jupiterApi.js';
 import {
   condNetDelta, condKraken24hMin, condSolUsd1hMove, condStaleData,
   condRpcBurn, condRaydium24hMin, condDailyPnl, condAdverseFill,
@@ -140,9 +146,6 @@ async function main(): Promise<void> {
   const bookCache = new BookCache(cfg.kraken.pair, logger);
   bookCache.run(cex, cfg.kraken.pair, 10).catch(e => logger.error({ err: e }, 'bookCache run crashed'));
   const publicTrades = new KrakenPublicTrades(cfg.kraken.cliBinaryPath, cfg.kraken.pair, logger);
-  // Candidate-only FIFO. The existing observer/paper lane deliberately keeps
-  // its pre-shadow direct Jupiter timing so evidence remains baseline-comparable.
-  const candidateQuoteLimiter = new JupiterQuoteRateLimiter(cfg.maxRpcCallsPerSec);
   store.cancelAllOpenPaperOrders(new Date().toISOString(), 'process_restart');
   store.cancelAllOpenCandidateOrders(new Date().toISOString(), 'process_restart');
   const paper = new PaperFillEngine({
@@ -167,9 +170,92 @@ async function main(): Promise<void> {
       };
     },
   });
-  const candidate = cfg.mode === 'observer' && cfg.candidate.enabled
-    ? new CandidateFillEngine({
-        ladder: cfg.candidate.ladder,
+  const candidateFingerprint = candidateStrategyFingerprint(cfg.candidate, {
+    jupiterMaxSlippageBps: cfg.jupiter.maxSlippageBps,
+  });
+  const candidateStartup = resolveCandidateApiKey(cfg.candidate);
+  if (cfg.mode === 'observer' && cfg.candidate.enabled && !candidateStartup.canStart) {
+    logger.error(
+      { apiKeyEnv: cfg.candidate.apiKeyEnv },
+      'candidate lane refused startup: configured Jupiter API key is absent or empty; baseline remains active',
+    );
+  }
+
+  let candidateSnapshot: CandidateEconomicSnapshot | null = null;
+  let candidate: CandidateFillEngine | null = null;
+  let candidateGuard: CandidateLaneGuard | null = null;
+  let candidateAdmission: CandidateCallAdmission | null = null;
+  let candidateQuote: typeof jupiterQuote | null = null;
+  let recordCandidateAttempt: ((
+    attemptKind: 'snapshot' | 'hedge',
+    startedAtMs: number,
+    requestedCallCount: number,
+    providerStatus: 'success' | 'error' | 'http_429' | 'capacity_skipped',
+    httpStatus: number | null,
+    rateLimit429Count: number,
+  ) => void) | null = null;
+  let recordCandidateProviderFailure: ((
+    err: unknown,
+    startedAtMs: number,
+    attemptKind: 'snapshot' | 'hedge',
+    requestedCallCount: number,
+  ) => void) | null = null;
+  let candidateLatchRecorded = false;
+
+  if (cfg.mode === 'observer' && candidateStartup.canStart && candidateStartup.apiKey !== null) {
+    const activatedAt = new Date();
+    const apiKey = candidateStartup.apiKey;
+    const admission = new CandidateCallAdmission(cfg.candidate.maxQuoteCallsPerSec);
+    candidateAdmission = admission;
+    const authenticatedQuote: typeof jupiterQuote = (args) => jupiterQuote({ ...args, apiKey });
+    candidateQuote = authenticatedQuote;
+    const guard = new CandidateLaneGuard({
+      disableOnProviderRateLimit: cfg.candidate.disableOnProviderRateLimit,
+      providerRateLimitConsecutiveThreshold: cfg.candidate.providerRateLimitConsecutiveThreshold,
+      providerRateLimitDefaultCooldownMs: cfg.candidate.providerRateLimitDefaultCooldownMs,
+      baselineWatchdogMs: cfg.candidate.baselineWatchdogMs,
+      activatedAtMs: activatedAt.getTime(),
+    });
+    candidateGuard = guard;
+
+    const recordAttempt = (
+      attemptKind: 'snapshot' | 'hedge',
+      startedAtMs: number,
+      requestedCallCount: number,
+      providerStatus: 'success' | 'error' | 'http_429' | 'capacity_skipped',
+      httpStatus: number | null,
+      rateLimit429Count: number,
+    ): void => {
+      const completedAtMs = Date.now();
+      store.insertCandidateQuoteAttempt({
+        attemptKind,
+        startedAt: new Date(startedAtMs).toISOString(),
+        completedAt: new Date(completedAtMs).toISOString(),
+        durationMs: Math.max(0, completedAtMs - startedAtMs),
+        requestedCallCount,
+        providerStatus,
+        httpStatus,
+        rateLimit429Count,
+        baselineSampleAgeMs: guard.baselineSampleAgeMs(startedAtMs),
+        strategyFingerprint: candidateFingerprint,
+      });
+    };
+
+    const recordProviderFailure = (err: unknown, startedAtMs: number, attemptKind: 'snapshot' | 'hedge', requestedCallCount: number): void => {
+      if (err instanceof JupiterQuoteHttpError) {
+        const rateLimited = err.status === 429;
+        recordAttempt(attemptKind, startedAtMs, requestedCallCount, rateLimited ? 'http_429' : 'error', err.status, rateLimited ? 1 : 0);
+        if (rateLimited) guard.recordProviderRateLimit(err.rateLimitResetAtMs);
+      } else {
+        recordAttempt(attemptKind, startedAtMs, requestedCallCount, 'error', null, 0);
+      }
+    };
+    recordCandidateAttempt = recordAttempt;
+    recordCandidateProviderFailure = recordProviderFailure;
+
+    const engine = new CandidateFillEngine({
+      strategyFingerprint: candidateFingerprint,
+      ladder: cfg.candidate.ladder,
         minAllInEdgeBps: cfg.candidate.minAllInEdgeBps,
         repriceThresholdBps: cfg.candidate.repriceThresholdBps,
         maxQuoteAgeMs: cfg.candidate.maxQuoteAgeMs,
@@ -185,22 +271,56 @@ async function main(): Promise<void> {
         stressFriction: cfg.candidate.stressFriction,
         store,
         hedgeBatch: async (side, sizeBert) => {
-          const mid = await dex.poolMidUsd();
-          const input = {
-            sizeBert,
-            raydiumMidUsd: mid.mid,
-            solUsd: mid.solUsd,
-            jupiterBaseUrl: cfg.jupiter.baseUrl,
-            slippageBps: cfg.jupiter.maxSlippageBps,
-            quote: candidateQuoteLimiter.quote,
-          };
-          const executable = side === 'buy'
-            ? await measureExecutableSell(input)
-            : await measureExecutableBuyExactOut(input);
-          return { dexPriceUsd: executable.priceUsd, dexImpactBps: executable.impactBps };
-        },
-      })
-    : null;
+          const startedAtMs = Date.now();
+          if (!guard.canAttemptProvider(startedAtMs) || !admission.tryAdmit(1, startedAtMs)) {
+            recordAttempt('hedge', startedAtMs, 1, 'capacity_skipped', null, 0);
+            throw new Error('candidate hedge quote capacity unavailable');
+          }
+          try {
+            const mid = await dex.poolMidUsd();
+            const input = {
+              sizeBert,
+              raydiumMidUsd: mid.mid,
+              solUsd: mid.solUsd,
+              jupiterBaseUrl: cfg.candidate.jupiterBaseUrl,
+              slippageBps: cfg.jupiter.maxSlippageBps,
+              quote: authenticatedQuote,
+            };
+            const executable = side === 'buy'
+              ? await measureExecutableSell(input)
+              : await measureExecutableBuyExactOut(input);
+            recordAttempt('hedge', startedAtMs, 1, 'success', 200, 0);
+            return { dexPriceUsd: executable.priceUsd, dexImpactBps: executable.impactBps };
+          } catch (err) {
+            recordProviderFailure(err, startedAtMs, 'hedge', 1);
+            throw err;
+          }
+      },
+    });
+    candidate = engine;
+    guard.setOnStateChange(() => {
+      engine.setExternalGates(guard.activeGates());
+      engine.updateQuotes(candidateSnapshot, new Date());
+      if (guard.isLatched() && !candidateLatchRecorded) {
+        candidateLatchRecorded = true;
+        const reason = guard.latchedReason() ?? 'unknown';
+        store.latchCandidateRuntime(reason, new Date().toISOString());
+        logger.error(
+          { reason, total429s: guard.total429Count() },
+          'CANDIDATE LANE LATCHED OFF FOR PROCESS LIFETIME; baseline remains active',
+        );
+      }
+    });
+    store.setCandidateRuntimeState(candidateFingerprint, activatedAt.toISOString());
+    logger.info(
+      {
+        strategyFingerprint: candidateFingerprint,
+        jupiterBaseUrl: cfg.candidate.jupiterBaseUrl,
+        maxQuoteCallsPerSec: cfg.candidate.maxQuoteCallsPerSec,
+      },
+      'candidate lane ready with keyed Jupiter endpoint',
+    );
+  }
   candidate?.restorePendingFills(store.listPendingCandidateFills());
   if (candidate) {
     publicTrades.onBatch(trades => {
@@ -386,6 +506,7 @@ async function main(): Promise<void> {
     const oracleTrusted = crossVenueTrust.trusted && bookAgeMs <= cfg.observer.maxBookAgeSec * 1000;
     const fee = await cex.feeTier();
     const paperCandidates: PaperQuoteCandidate[] = [];
+    let successfulSamples = 0;
     for (const rawSize of cfg.observer.sizesBert) {
       try {
         const sizeBert = new Decimal(rawSize);
@@ -402,6 +523,7 @@ async function main(): Promise<void> {
           sellMakerEdgeBps: e.sellMakerEdgeBps.toString(), dexSellImpactBps: e.dexSellImpactBps.toString(),
           dexBuyImpactBps: e.dexBuyImpactBps.toString(), bookAgeMs, oracleTrusted,
         });
+        successfulSamples += 1;
         const fixedCostBps = sizeBert.mul(mid.mid).gt(0)
           ? new Decimal(cfg.paper.transactionCostUsd).div(sizeBert.mul(mid.mid)).mul(10_000)
           : new Decimal(0);
@@ -420,6 +542,7 @@ async function main(): Promise<void> {
       }
     }
     if (cfg.paper.enabled) paper.updateQuotes(paperCandidates);
+    if (successfulSamples > 0) candidateGuard?.recordBaselineSuccess();
   };
   let observerTimer: NodeJS.Timeout | undefined;
   if (cfg.mode === 'observer') {
@@ -428,10 +551,17 @@ async function main(): Promise<void> {
   }
 
   let candidateTimer: NodeJS.Timeout | undefined;
-  let candidateSnapshot: CandidateEconomicSnapshot | null = null;
   let candidateRefreshInFlight = false;
+  const candidateSnapshotCallCount = new Set(cfg.candidate.ladder.map(rung => String(rung.sizeBert))).size * 2;
   const refreshCandidateSnapshot = async (): Promise<void> => {
-    if (!candidate || candidateRefreshInFlight) return;
+    if (!candidate || !candidateGuard || !candidateAdmission || !candidateQuote
+      || !recordCandidateAttempt || !recordCandidateProviderFailure || candidateRefreshInFlight) return;
+    const startedAtMs = Date.now();
+    if (!candidateGuard.canAttemptProvider(startedAtMs)) return;
+    if (!candidateAdmission.tryAdmit(candidateSnapshotCallCount, startedAtMs)) {
+      recordCandidateAttempt('snapshot', startedAtMs, candidateSnapshotCallCount, 'capacity_skipped', null, 0);
+      return;
+    }
     candidateRefreshInFlight = true;
     try {
       const book = bookCache.snapshot();
@@ -442,23 +572,39 @@ async function main(): Promise<void> {
         raydiumMidUsd: mid.mid,
         solUsd: mid.solUsd,
         book,
-        jupiterBaseUrl: cfg.jupiter.baseUrl,
+        jupiterBaseUrl: cfg.candidate.jupiterBaseUrl,
         slippageBps: cfg.jupiter.maxSlippageBps,
-        quote: candidateQuoteLimiter.quote,
+        quote: candidateQuote,
       });
       candidateSnapshot = snapshot;
       candidate.recordRefreshSuccess();
-      store.insertCandidateSnapshot(snapshot);
+      store.insertCandidateSnapshot(snapshot, candidateFingerprint);
+      recordCandidateAttempt('snapshot', startedAtMs, candidateSnapshotCallCount, 'success', 200, 0);
+      candidateGuard.recordSnapshotSuccess();
     } catch (err) {
       candidate.recordRefreshFailure();
-      logger.warn({ err }, 'candidate: complete executable snapshot refresh failed');
+      recordCandidateProviderFailure(err, startedAtMs, 'snapshot', candidateSnapshotCallCount);
+      if (err instanceof JupiterQuoteHttpError && err.status === 429) {
+        logger.error(
+          {
+            consecutive429s: candidateGuard.consecutive429Count(),
+            total429s: candidateGuard.total429Count(),
+            latched: candidateGuard.isLatched(),
+          },
+          'candidate: Jupiter provider rate limit; quotes pulled and cooldown engaged',
+        );
+      } else {
+        logger.warn({ err }, 'candidate: complete executable snapshot refresh failed');
+      }
     } finally {
       candidateRefreshInFlight = false;
     }
   };
   const candidateTick = (): void => {
-    if (!candidate) return;
+    if (!candidate || !candidateGuard) return;
+    candidateGuard.checkBaselineWatchdog();
     candidate.updateQuotes(candidateSnapshot, new Date());
+    if (candidateGuard.isLatched()) return;
     if (candidate.hasPendingHedge()) {
       void candidate.retryPendingHedges().catch(err => logger.warn({ err }, 'candidate: simulated hedge retry failed'));
     }
