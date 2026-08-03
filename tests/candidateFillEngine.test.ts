@@ -30,7 +30,8 @@ function harness(overrides: Partial<CandidateFillEngineOpts> = {}) {
     syncCandidateGatePeriods: vi.fn(),
   };
   const opts: CandidateFillEngineOpts = {
-    strategyFingerprint: 'test-fingerprint',
+    economicFingerprint: 'test-economic-fingerprint',
+    operationalFingerprint: 'test-operational-fingerprint',
     ladder: [{ sizeBert: 100, distanceBps: 175 }, { sizeBert: 100, distanceBps: 400 }],
     minAllInEdgeBps: 75,
     repriceThresholdBps: 10,
@@ -224,7 +225,8 @@ describe('CandidateFillEngine', () => {
     const now = new Date('2026-08-03T00:03:00.001Z');
     engine.restorePendingFills([{
       candidateFillId: 'cf-old', candidateOrderId: 'co-old', krakenTradeId: 31,
-      strategyFingerprint: 'test-fingerprint',
+      economicFingerprint: 'test-economic-fingerprint',
+      operationalFingerprint: 'test-operational-fingerprint',
       hedgeBatchId: 'ch-old', side: 'buy', distanceBps: '400', fillPriceUsd: '0.096',
       volumeBert: '50', orderRemainingBert: '50', referencePriceUsd: '0.1',
       referenceImpactBps: '2', t: '2026-08-03T00:00:00.000Z',
@@ -240,7 +242,8 @@ describe('CandidateFillEngine', () => {
     const recoveryNow = new Date('2026-08-03T00:01:00.000Z');
     recovered.engine.restorePendingFills([{
       candidateFillId: 'cf-recent', candidateOrderId: 'co-recent', krakenTradeId: 32,
-      strategyFingerprint: 'test-fingerprint',
+      economicFingerprint: 'test-economic-fingerprint',
+      operationalFingerprint: 'test-operational-fingerprint',
       hedgeBatchId: 'ch-recent', side: 'buy', distanceBps: '400', fillPriceUsd: '0.096',
       volumeBert: '50', orderRemainingBert: '50', referencePriceUsd: '0.1',
       referenceImpactBps: '2', t: '2026-08-03T00:00:30.000Z',

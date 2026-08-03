@@ -3,7 +3,8 @@ import { CandidateConfigSchema } from '../src/config.js';
 import {
   CandidateCallAdmission,
   CandidateLaneGuard,
-  candidateStrategyFingerprint,
+  candidateFingerprints,
+  effectiveBaselineWatchdogMs,
   resolveCandidateApiKey,
 } from '../src/candidateRuntime.js';
 
@@ -41,7 +42,6 @@ describe('candidate keyed runtime controls', () => {
       providerRateLimitConsecutiveThreshold: 3,
       providerRateLimitDefaultCooldownMs: 60_000,
       baselineWatchdogMs: 45_000,
-      activatedAtMs: 0,
       onStateChange: changes,
     });
 
@@ -61,37 +61,70 @@ describe('candidate keyed runtime controls', () => {
     expect(changes).toHaveBeenCalledTimes(3);
   });
 
-  it('latches when the baseline has not succeeded inside its watchdog window', () => {
+  it('does not latch during a cold restart and slow first successful baseline size', () => {
+    const graceMs = effectiveBaselineWatchdogMs(45_000, 30_000);
+    expect(graceMs).toBe(90_000);
     const guard = new CandidateLaneGuard({
       disableOnProviderRateLimit: true,
       providerRateLimitConsecutiveThreshold: 3,
       providerRateLimitDefaultCooldownMs: 60_000,
-      baselineWatchdogMs: 45_000,
-      activatedAtMs: 1000,
+      baselineWatchdogMs: graceMs,
     });
-    guard.recordBaselineSuccess(10_000);
-    expect(guard.checkBaselineWatchdog(54_999)).toBe(false);
-    expect(guard.checkBaselineWatchdog(55_000)).toBe(true);
+
+    // Candidate activation alone does not arm the watchdog. The cold-book tick does.
+    expect(guard.checkBaselineWatchdog(1_000_000)).toBe(false);
+    guard.recordBaselineAttempt(0);
+    expect(guard.checkBaselineWatchdog(45_000)).toBe(false);
+    guard.recordBaselineAttempt(30_000);
+    expect(guard.checkBaselineWatchdog(59_999)).toBe(false);
+
+    // The first completed size is enough; the remaining size loop may still be running.
+    guard.recordBaselineSuccess(60_000);
+    expect(guard.checkBaselineWatchdog(120_000)).toBe(false);
+    expect(guard.isLatched()).toBe(false);
+  });
+
+  it('latches a genuinely dead baseline after the effective restart grace', () => {
+    const graceMs = effectiveBaselineWatchdogMs(45_000, 30_000);
+    const guard = new CandidateLaneGuard({
+      disableOnProviderRateLimit: true,
+      providerRateLimitConsecutiveThreshold: 3,
+      providerRateLimitDefaultCooldownMs: 60_000,
+      baselineWatchdogMs: graceMs,
+    });
+    guard.recordBaselineAttempt(1000);
+    expect(guard.checkBaselineWatchdog(1000 + graceMs - 1)).toBe(false);
+    expect(guard.checkBaselineWatchdog(1000 + graceMs)).toBe(true);
     expect(guard.latchedReason()).toBe('baseline_watchdog');
     expect(guard.activeGates()).toEqual([expect.objectContaining({ gate: 'baseline_watchdog' })]);
   });
 
-  it('produces a stable fingerprint and changes it when the operating point changes', () => {
+  it('separates stable economic identity from operational tuning', () => {
     const config = CandidateConfigSchema.parse({});
-    const context = { jupiterMaxSlippageBps: 50 };
-    const first = candidateStrategyFingerprint(config, context);
+    const context = { jupiterMaxSlippageBps: 50, observerSampleCadenceMs: 30_000 };
+    const first = candidateFingerprints(config, context);
     const reordered = CandidateConfigSchema.parse({
       stressFriction: config.stressFriction,
       ladder: config.ladder.map(rung => ({ ...rung })),
       maxQuoteCallsPerSec: config.maxQuoteCallsPerSec,
     });
-    expect(candidateStrategyFingerprint(reordered, context)).toBe(first);
-    expect(candidateStrategyFingerprint({ ...config, maxQuoteCallsPerSec: 7 }, context)).not.toBe(first);
-    expect(candidateStrategyFingerprint({
+    expect(candidateFingerprints(reordered, context)).toEqual(first);
+
+    const capacityChange = candidateFingerprints({ ...config, maxQuoteCallsPerSec: 7 }, context);
+    expect(capacityChange.economicFingerprint).toBe(first.economicFingerprint);
+    expect(capacityChange.operationalFingerprint).not.toBe(first.operationalFingerprint);
+
+    const economicChange = candidateFingerprints({
       ...config,
       ladder: config.ladder.map((rung, index) => index === 0 ? { ...rung, distanceBps: 176 } : rung),
-    }, context)).not.toBe(first);
-    expect(candidateStrategyFingerprint(config, { jupiterMaxSlippageBps: 75 })).not.toBe(first);
-    expect(first).toMatch(/^[a-f0-9]{64}$/);
+    }, context);
+    expect(economicChange.economicFingerprint).not.toBe(first.economicFingerprint);
+    expect(economicChange.operationalFingerprint).toBe(first.operationalFingerprint);
+
+    const slippageChange = candidateFingerprints(config, { ...context, jupiterMaxSlippageBps: 75 });
+    expect(slippageChange.economicFingerprint).not.toBe(first.economicFingerprint);
+    expect(slippageChange.operationalFingerprint).toBe(first.operationalFingerprint);
+    expect(first.economicFingerprint).toMatch(/^[a-f0-9]{64}$/);
+    expect(first.operationalFingerprint).toMatch(/^[a-f0-9]{64}$/);
   });
 });

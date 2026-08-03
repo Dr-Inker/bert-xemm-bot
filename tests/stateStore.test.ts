@@ -77,9 +77,10 @@ describe('StateStore', () => {
         sellImpactBps: new Decimal(2), buyImpactBps: new Decimal(3),
         sellRouteDeviationBps: new Decimal(0), buyRouteDeviationBps: new Decimal(0),
       }]]),
-    }, 'fingerprint-a', t);
+    }, 'economic-a', 'operational-a', t);
     store.upsertCandidateOrder({
-      candidateOrderId: 'co1', strategyFingerprint: 'fingerprint-a', rungIndex: 1, side: 'buy', distanceBps: '400', price: '0.09615',
+      candidateOrderId: 'co1', economicFingerprint: 'economic-a', operationalFingerprint: 'operational-a',
+      rungIndex: 1, side: 'buy', distanceBps: '400', price: '0.09615',
       sizeBert: '500', remainingBert: '450', queueAheadAtPlacementBert: '100', queueAheadRemainingBert: '0',
       referencePriceUsd: '0.1', referenceImpactBps: '2', expectedGrossEdgeBps: '400',
       expectedNormalNetEdgeBps: '342', expectedStressNetEdgeBps: '306',
@@ -87,7 +88,8 @@ describe('StateStore', () => {
     });
     store.closeCandidateOrder('co1', '450', t.toISOString(), 'cancel_on_fill');
     store.upsertCandidateFill({
-      candidateFillId: 'cf1', candidateOrderId: 'co1', strategyFingerprint: 'fingerprint-a', krakenTradeId: 101, hedgeBatchId: 'ch1', side: 'buy',
+      candidateFillId: 'cf1', candidateOrderId: 'co1', economicFingerprint: 'economic-a', operationalFingerprint: 'operational-a',
+      krakenTradeId: 101, hedgeBatchId: 'ch1', side: 'buy',
       distanceBps: '400', fillPriceUsd: '0.09615', volumeBert: '50', orderRemainingBert: '450',
       dexHedgePriceUsd: '0.1', dexImpactBps: '2', grossPnlUsd: '0.1925',
       normalMakerFeeUsd: '0.011', normalLatencyCostUsd: '0.01', normalFailureReserveUsd: '0.005',
@@ -100,13 +102,13 @@ describe('StateStore', () => {
     store.abandonCandidateHedgeBatch('ch1', new Date(t.getTime() + 500).toISOString(), 'pending_hedge_expired');
     store.syncCandidateGatePeriods([{ gate: 'route_gate_buy_500', detailJson: '{"deviationBps":"80"}' }], t.toISOString());
     store.syncCandidateGatePeriods([], new Date(t.getTime() + 1000).toISOString());
-    store.setCandidateRuntimeState('fingerprint-a', t.toISOString());
+    store.setCandidateRuntimeState('economic-a', 'operational-a', t.toISOString());
     store.insertCandidateQuoteAttempt({
       attemptKind: 'snapshot', startedAt: t.toISOString(),
       completedAt: new Date(t.getTime() + 850).toISOString(), durationMs: 850,
       requestedCallCount: 4, providerStatus: 'success', httpStatus: 200,
       rateLimit429Count: 0, baselineSampleAgeMs: 30_000,
-      strategyFingerprint: 'fingerprint-a',
+      economicFingerprint: 'economic-a', operationalFingerprint: 'operational-a',
     });
     store.latchCandidateRuntime('baseline_watchdog', new Date(t.getTime() + 45_000).toISOString());
 
@@ -118,15 +120,42 @@ describe('StateStore', () => {
       .toEqual({ normal_net_pnl_usd: '0.1465', stress_net_pnl_usd: '0.1105' });
     expect((db.prepare('SELECT hedge_status,hedge_terminal_reason FROM candidate_fills').get() as Record<string, string>))
       .toEqual({ hedge_status: 'abandoned', hedge_terminal_reason: 'pending_hedge_expired' });
-    expect((db.prepare('SELECT DISTINCT strategy_fingerprint FROM candidate_snapshots').get() as { strategy_fingerprint: string }).strategy_fingerprint)
-      .toBe('fingerprint-a');
-    expect((db.prepare('SELECT strategy_fingerprint FROM candidate_orders').get() as { strategy_fingerprint: string }).strategy_fingerprint)
-      .toBe('fingerprint-a');
+    expect((db.prepare('SELECT DISTINCT economic_fingerprint,operational_fingerprint FROM candidate_snapshots').get() as Record<string, string>))
+      .toEqual({ economic_fingerprint: 'economic-a', operational_fingerprint: 'operational-a' });
+    expect((db.prepare('SELECT economic_fingerprint,operational_fingerprint FROM candidate_orders').get() as Record<string, string>))
+      .toEqual({ economic_fingerprint: 'economic-a', operational_fingerprint: 'operational-a' });
     expect((db.prepare('SELECT duration_ms,provider_status,baseline_sample_age_ms FROM candidate_quote_attempts').get() as Record<string, unknown>))
       .toEqual({ duration_ms: 850, provider_status: 'success', baseline_sample_age_ms: 30_000 });
-    expect((db.prepare('SELECT strategy_fingerprint,latch_reason FROM candidate_runtime_state').get() as Record<string, string>))
-      .toEqual({ strategy_fingerprint: 'fingerprint-a', latch_reason: 'baseline_watchdog' });
+    expect((db.prepare(`SELECT economic_fingerprint,operational_fingerprint,latch_reason
+      FROM candidate_runtime_state`).get() as Record<string, string>))
+      .toEqual({
+        economic_fingerprint: 'economic-a',
+        operational_fingerprint: 'operational-a',
+        latch_reason: 'baseline_watchdog',
+      });
     expect((db.prepare('SELECT ended_at FROM candidate_gate_periods').get() as { ended_at: string }).ended_at).not.toBeNull();
+  });
+
+  it('prunes candidate quote-attempt telemetry before the retention cutoff', () => {
+    const attempt = {
+      attemptKind: 'snapshot' as const,
+      completedAt: '2026-08-01T00:00:01.000Z',
+      durationMs: 1000,
+      requestedCallCount: 4,
+      providerStatus: 'success' as const,
+      httpStatus: 200,
+      rateLimit429Count: 0,
+      baselineSampleAgeMs: 0,
+      economicFingerprint: 'economic-a',
+      operationalFingerprint: 'operational-a',
+    };
+    store.insertCandidateQuoteAttempt({ ...attempt, startedAt: '2026-07-01T00:00:00.000Z' });
+    store.insertCandidateQuoteAttempt({ ...attempt, startedAt: '2026-08-01T00:00:00.000Z' });
+
+    expect(store.pruneCandidateQuoteAttempts('2026-07-15T00:00:00.000Z')).toBe(1);
+    const db = (store as unknown as { db: import('better-sqlite3').Database }).db;
+    expect((db.prepare('SELECT started_at FROM candidate_quote_attempts').all() as Array<{ started_at: string }>))
+      .toEqual([{ started_at: '2026-08-01T00:00:00.000Z' }]);
   });
 
   it('enforces foreign keys and installs dashboard query indexes', () => {

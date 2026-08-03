@@ -1,7 +1,9 @@
 import { createHash } from 'node:crypto';
 import type { CandidateConfig } from './config.js';
 
-export const CANDIDATE_STRATEGY_IMPLEMENTATION = 'candidate-shadow-v2-keyed-1';
+export const CANDIDATE_ECONOMIC_IMPLEMENTATION = 'candidate-shadow-v2-economics-1';
+export const CANDIDATE_OPERATIONAL_IMPLEMENTATION = 'candidate-keyed-provider-2';
+export const CANDIDATE_QUOTE_ATTEMPT_RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
 
 export interface CandidateGateRecord {
   gate: 'provider_rate_limited' | 'baseline_watchdog';
@@ -10,7 +12,11 @@ export interface CandidateGateRecord {
 
 /**
  * A rolling one-second call budget. Reservations are atomic and never wait, so
- * a rejected snapshot cannot become a queued catch-up burst later.
+ * a rejected snapshot cannot become a queued catch-up burst later. Accounting
+ * is intentionally keyed to reservation time rather than individual fetch
+ * starts: candidateRefreshInFlight permits one snapshot and fill batching
+ * permits at most two hedge reservations, bounding real candidate concurrency
+ * at the configured six-call default.
  */
 export class CandidateCallAdmission {
   private reservations: Array<{ atMs: number; count: number }> = [];
@@ -42,7 +48,8 @@ export interface CandidateStartupDecision {
 }
 
 export interface CandidateDashboardIdentityInput {
-  strategyFingerprint: string | null;
+  economicFingerprint: string | null;
+  operationalFingerprint: string | null;
   activatedAt: string | null;
   latchedAt: string | null;
   latchReason: string | null;
@@ -52,13 +59,15 @@ export interface CandidateDashboardIdentityInput {
 
 /** Allow-list the only runtime identity fields permitted in dashboard output. */
 export function sanitizeCandidateDashboardIdentity(input: CandidateDashboardIdentityInput): {
-  strategyFingerprint: string | null;
+  economicFingerprint: string | null;
+  operationalFingerprint: string | null;
   activatedAt: string | null;
   latchedAt: string | null;
   latchReason: string | null;
 } {
   return {
-    strategyFingerprint: input.strategyFingerprint,
+    economicFingerprint: input.economicFingerprint,
+    operationalFingerprint: input.operationalFingerprint,
     activatedAt: input.activatedAt,
     latchedAt: input.latchedAt,
     latchReason: input.latchReason,
@@ -76,23 +85,23 @@ export function resolveCandidateApiKey(
   return { canStart: true, apiKey: value, reason: null };
 }
 
-/** Stable, secret-free identity for evidence generated under one operating point. */
-export function candidateStrategyFingerprint(
+export interface CandidateFingerprints {
+  economicFingerprint: string;
+  operationalFingerprint: string;
+}
+
+/** Stable, secret-free identities for economics versus provider operations. */
+export function candidateFingerprints(
   config: CandidateConfig,
-  context: { jupiterMaxSlippageBps: number },
-): string {
-  const material = {
-    implementation: CANDIDATE_STRATEGY_IMPLEMENTATION,
+  context: { jupiterMaxSlippageBps: number; observerSampleCadenceMs: number },
+): CandidateFingerprints {
+  const economicMaterial = {
+    implementation: CANDIDATE_ECONOMIC_IMPLEMENTATION,
     snapshotQuoteDirectionsPerSize: 2,
     postOnlyTickUsd: '0.000001',
     jupiterMaxSlippageBps: context.jupiterMaxSlippageBps,
+    jupiterBaseUrlHost: new URL(config.jupiterBaseUrl).host.toLowerCase(),
     config: {
-      jupiterBaseUrl: config.jupiterBaseUrl,
-      maxQuoteCallsPerSec: config.maxQuoteCallsPerSec,
-      disableOnProviderRateLimit: config.disableOnProviderRateLimit,
-      providerRateLimitConsecutiveThreshold: config.providerRateLimitConsecutiveThreshold,
-      providerRateLimitDefaultCooldownMs: config.providerRateLimitDefaultCooldownMs,
-      baselineWatchdogMs: config.baselineWatchdogMs,
       ladder: config.ladder,
       minAllInEdgeBps: config.minAllInEdgeBps,
       decisionCadenceMs: config.decisionCadenceMs,
@@ -110,7 +119,29 @@ export function candidateStrategyFingerprint(
       stressFriction: config.stressFriction,
     },
   };
-  return createHash('sha256').update(stableJson(material)).digest('hex');
+  const operationalMaterial = {
+    implementation: CANDIDATE_OPERATIONAL_IMPLEMENTATION,
+    config: {
+      maxQuoteCallsPerSec: config.maxQuoteCallsPerSec,
+      disableOnProviderRateLimit: config.disableOnProviderRateLimit,
+      providerRateLimitConsecutiveThreshold: config.providerRateLimitConsecutiveThreshold,
+      providerRateLimitDefaultCooldownMs: config.providerRateLimitDefaultCooldownMs,
+      baselineWatchdogMs: config.baselineWatchdogMs,
+      observerSampleCadenceMs: context.observerSampleCadenceMs,
+      effectiveBaselineWatchdogMs: effectiveBaselineWatchdogMs(
+        config.baselineWatchdogMs,
+        context.observerSampleCadenceMs,
+      ),
+    },
+  };
+  return {
+    economicFingerprint: hashMaterial(economicMaterial),
+    operationalFingerprint: hashMaterial(operationalMaterial),
+  };
+}
+
+export function effectiveBaselineWatchdogMs(configuredMs: number, observerSampleCadenceMs: number): number {
+  return Math.max(configuredMs, 3 * observerSampleCadenceMs);
 }
 
 export interface CandidateLaneGuardOptions {
@@ -118,13 +149,12 @@ export interface CandidateLaneGuardOptions {
   providerRateLimitConsecutiveThreshold: number;
   providerRateLimitDefaultCooldownMs: number;
   baselineWatchdogMs: number;
-  activatedAtMs?: number;
   onStateChange?: () => void;
 }
 
 /** Provider cooldown, process-lifetime latches, and baseline starvation guard. */
 export class CandidateLaneGuard {
-  private readonly activatedAtMs: number;
+  private firstBaselineAttemptAtMs: number | null = null;
   private lastBaselineSuccessAtMs: number | null = null;
   private consecutive429s = 0;
   private provider429s = 0;
@@ -134,7 +164,6 @@ export class CandidateLaneGuard {
   private onStateChange: (() => void) | undefined;
 
   constructor(private readonly opts: CandidateLaneGuardOptions) {
-    this.activatedAtMs = opts.activatedAtMs ?? Date.now();
     this.onStateChange = opts.onStateChange;
   }
 
@@ -148,16 +177,23 @@ export class CandidateLaneGuard {
     return !this.isLatched() && nowMs >= this.nextProviderAttemptAtMs;
   }
 
+  recordBaselineAttempt(atMs = Date.now()): void {
+    this.firstBaselineAttemptAtMs ??= atMs;
+  }
+
   recordBaselineSuccess(atMs = Date.now()): void {
+    this.firstBaselineAttemptAtMs ??= atMs;
     this.lastBaselineSuccessAtMs = atMs;
   }
 
   baselineSampleAgeMs(nowMs = Date.now()): number {
-    return Math.max(0, nowMs - (this.lastBaselineSuccessAtMs ?? this.activatedAtMs));
+    const baseline = this.lastBaselineSuccessAtMs ?? this.firstBaselineAttemptAtMs;
+    return baseline === null ? 0 : Math.max(0, nowMs - baseline);
   }
 
   checkBaselineWatchdog(nowMs = Date.now()): boolean {
-    if (this.isLatched() || this.baselineSampleAgeMs(nowMs) < this.opts.baselineWatchdogMs) return false;
+    if (this.isLatched() || this.firstBaselineAttemptAtMs === null
+      || this.baselineSampleAgeMs(nowMs) < this.opts.baselineWatchdogMs) return false;
     this.latchReason = 'baseline_watchdog';
     this.emit();
     return true;
@@ -218,4 +254,8 @@ function stableJson(value: unknown): string {
     return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${stableJson(item)}`).join(',')}}`;
   }
   return JSON.stringify(value);
+}
+
+function hashMaterial(value: unknown): string {
+  return createHash('sha256').update(stableJson(value)).digest('hex');
 }

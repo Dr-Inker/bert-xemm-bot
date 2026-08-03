@@ -17,7 +17,8 @@ export interface CandidateLadderRung {
 
 export interface CandidateOrder {
   candidateOrderId: string;
-  strategyFingerprint: string;
+  economicFingerprint: string;
+  operationalFingerprint: string;
   rungIndex: number;
   side: Side;
   distanceBps: string;
@@ -38,7 +39,8 @@ export interface CandidateOrder {
 
 export interface CandidateFillRecord {
   candidateFillId: string;
-  strategyFingerprint: string;
+  economicFingerprint: string;
+  operationalFingerprint: string;
   candidateOrderId: string;
   krakenTradeId: number;
   hedgeBatchId: string;
@@ -75,7 +77,8 @@ export interface CandidateHedgeResult {
 export interface CandidatePendingFill {
   candidateFillId: string;
   candidateOrderId: string;
-  strategyFingerprint: string;
+  economicFingerprint: string;
+  operationalFingerprint: string;
   krakenTradeId: number;
   hedgeBatchId: string;
   side: Side;
@@ -89,7 +92,8 @@ export interface CandidatePendingFill {
 }
 
 export interface CandidateFillEngineOpts {
-  strategyFingerprint: string;
+  economicFingerprint: string;
+  operationalFingerprint: string;
   ladder: CandidateLadderRung[];
   minAllInEdgeBps: number;
   repriceThresholdBps: number;
@@ -115,7 +119,7 @@ export interface CandidateFillEngineOpts {
 }
 
 type AllocationOrder = Pick<CandidateOrder,
-  'candidateOrderId' | 'strategyFingerprint' | 'side' | 'distanceBps' | 'price' | 'referencePriceUsd' | 'referenceImpactBps'>;
+  'candidateOrderId' | 'economicFingerprint' | 'operationalFingerprint' | 'side' | 'distanceBps' | 'price' | 'referencePriceUsd' | 'referenceImpactBps'>;
 
 interface Allocation {
   fillId: string;
@@ -226,7 +230,8 @@ export class CandidateFillEngine {
         fillId: fill.candidateFillId,
         order: {
           candidateOrderId: fill.candidateOrderId,
-          strategyFingerprint: fill.strategyFingerprint,
+          economicFingerprint: fill.economicFingerprint,
+          operationalFingerprint: fill.operationalFingerprint,
           side: fill.side,
           distanceBps: fill.distanceBps,
           price: fill.fillPriceUsd,
@@ -425,7 +430,8 @@ export class CandidateFillEngine {
     const queue = queueAhead(snapshot.book, side, price);
     const order: CandidateOrder = {
       candidateOrderId: `candidate-${side}-${rungIndex}-${now.getTime()}-${++this.orderSeq}`,
-      strategyFingerprint: this.opts.strategyFingerprint,
+      economicFingerprint: this.opts.economicFingerprint,
+      operationalFingerprint: this.opts.operationalFingerprint,
       rungIndex,
       side,
       distanceBps: new Decimal(rung.distanceBps).toString(),
@@ -468,7 +474,8 @@ export class CandidateFillEngine {
       const stress = realizedEconomics(allocation.order.side, fillPrice, allocation.volume, dexPrice, this.opts.stressFriction, txShare);
       this.opts.store.upsertCandidateFill({
         candidateFillId: allocation.fillId,
-        strategyFingerprint: allocation.order.strategyFingerprint,
+        economicFingerprint: allocation.order.economicFingerprint,
+        operationalFingerprint: allocation.order.operationalFingerprint,
         candidateOrderId: allocation.order.candidateOrderId,
         krakenTradeId: allocation.trade.tradeId,
         hedgeBatchId: batchId,

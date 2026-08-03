@@ -24,7 +24,8 @@ interface RawCandidateFill {
 interface RawGatePeriod { gate: string; started_at: string; ended_at: string | null }
 interface RawCloseReason { close_reason: string; n: number }
 interface RawCandidateRuntime {
-  strategy_fingerprint: string; activated_at: string; latched_at: string | null; latch_reason: string | null;
+  economic_fingerprint: string; operational_fingerprint: string;
+  activated_at: string; latched_at: string | null; latch_reason: string | null;
 }
 interface RawCandidateAttempt {
   duration_ms: number; provider_status: string; rate_limit_429_count: number;
@@ -42,30 +43,32 @@ const paperRows = db.prepare(`SELECT paper_fill_id,side,volume_bert,gross_pnl_us
   transaction_cost_usd,latency_cost_usd,failure_reserve_usd,net_pnl_usd,t
   FROM paper_fills WHERE t >= ? ORDER BY t ASC`).all(since) as RawPaperFill[];
 const openPaperOrders = (db.prepare(`SELECT COUNT(*) n FROM paper_orders WHERE status='open'`).get() as { n: number }).n;
-const candidateRuntime = db.prepare(`SELECT strategy_fingerprint,activated_at,latched_at,latch_reason
+const candidateRuntime = db.prepare(`SELECT economic_fingerprint,operational_fingerprint,
+  activated_at,latched_at,latch_reason
   FROM candidate_runtime_state WHERE singleton=1`).get() as RawCandidateRuntime | undefined;
-const currentCandidateFingerprint = candidateRuntime?.strategy_fingerprint ?? null;
+const currentEconomicFingerprint = candidateRuntime?.economic_fingerprint ?? null;
+const currentOperationalFingerprint = candidateRuntime?.operational_fingerprint ?? null;
 const candidateRows = db.prepare(`SELECT candidate_fill_id,side,distance_bps,volume_bert,gross_pnl_usd,
   normal_net_pnl_usd,stress_net_pnl_usd,hedge_status,economics_source,
   hedge_resolved_at,hedge_terminal_reason,t
-  FROM candidate_fills WHERE t >= ? AND strategy_fingerprint = ? ORDER BY t ASC`)
-  .all(since, currentCandidateFingerprint ?? '') as RawCandidateFill[];
+  FROM candidate_fills WHERE t >= ? AND economic_fingerprint = ? ORDER BY t ASC`)
+  .all(since, currentEconomicFingerprint ?? '') as RawCandidateFill[];
 const openCandidateOrders = (db.prepare(`SELECT COUNT(*) n FROM candidate_orders
-  WHERE status='open' AND strategy_fingerprint = ?`).get(currentCandidateFingerprint ?? '') as { n: number }).n;
+  WHERE status='open' AND economic_fingerprint = ?`).get(currentEconomicFingerprint ?? '') as { n: number }).n;
 const publicTrades24h = (db.prepare(`SELECT COUNT(*) n FROM public_trades WHERE t >= ?`).get(since) as { n: number }).n;
 const candidateSnapshots24h = (db.prepare(`SELECT COUNT(DISTINCT t) n FROM candidate_snapshots
-  WHERE t >= ? AND strategy_fingerprint = ?`).get(since, currentCandidateFingerprint ?? '') as { n: number }).n;
+  WHERE t >= ? AND economic_fingerprint = ?`).get(since, currentEconomicFingerprint ?? '') as { n: number }).n;
 const latestCandidateSnapshot = (db.prepare(`SELECT MAX(t) t FROM candidate_snapshots
-  WHERE strategy_fingerprint = ?`).get(currentCandidateFingerprint ?? '') as { t: string | null }).t;
+  WHERE economic_fingerprint = ?`).get(currentEconomicFingerprint ?? '') as { t: string | null }).t;
 const candidateAttempts = db.prepare(`SELECT duration_ms,provider_status,rate_limit_429_count,
   baseline_sample_age_ms,attempt_kind FROM candidate_quote_attempts
-  WHERE started_at >= ? AND strategy_fingerprint = ? ORDER BY started_at ASC`)
-  .all(since, currentCandidateFingerprint ?? '') as RawCandidateAttempt[];
+  WHERE started_at >= ? AND economic_fingerprint = ? ORDER BY started_at ASC`)
+  .all(since, currentEconomicFingerprint ?? '') as RawCandidateAttempt[];
 const gateRows = db.prepare(`SELECT gate,started_at,ended_at FROM candidate_gate_periods
   WHERE ended_at IS NULL OR ended_at >= ? OR started_at >= ? ORDER BY started_at ASC`).all(since, since) as RawGatePeriod[];
 const closeReasons = db.prepare(`SELECT close_reason,COUNT(*) n FROM candidate_orders
-  WHERE updated_at >= ? AND strategy_fingerprint = ? AND close_reason IS NOT NULL
-  GROUP BY close_reason ORDER BY close_reason`).all(since, currentCandidateFingerprint ?? '') as RawCloseReason[];
+  WHERE updated_at >= ? AND economic_fingerprint = ? AND close_reason IS NOT NULL
+  GROUP BY close_reason ORDER BY close_reason`).all(since, currentEconomicFingerprint ?? '') as RawCloseReason[];
 db.close();
 
 const samples = rows.map(r => ({
@@ -157,7 +160,8 @@ const payload = {
   },
   candidate: {
     ...sanitizeCandidateDashboardIdentity({
-      strategyFingerprint: currentCandidateFingerprint,
+      economicFingerprint: currentEconomicFingerprint,
+      operationalFingerprint: currentOperationalFingerprint,
       activatedAt: candidateRuntime?.activated_at ?? null,
       latchedAt: candidateRuntime?.latched_at ?? null,
       latchReason: candidateRuntime?.latch_reason ?? null,

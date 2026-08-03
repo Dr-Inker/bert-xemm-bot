@@ -25,9 +25,11 @@ import {
   type CandidateEconomicSnapshot,
 } from './candidateQuoteSampler.js';
 import {
+  CANDIDATE_QUOTE_ATTEMPT_RETENTION_MS,
   CandidateCallAdmission,
   CandidateLaneGuard,
-  candidateStrategyFingerprint,
+  candidateFingerprints,
+  effectiveBaselineWatchdogMs,
   resolveCandidateApiKey,
 } from './candidateRuntime.js';
 import { jupiterQuote, JupiterQuoteHttpError } from './venues/jupiterApi.js';
@@ -81,6 +83,14 @@ class Kraken24hVol {
 async function main(): Promise<void> {
   const { cfg, store, cex, dex, notifier, connection, rpcCounter } = wireVenues();
   logger.info({ mode: cfg.mode, enabled: cfg.enabled }, 'startup');
+
+  const pruneCandidateAttemptTelemetry = (): void => {
+    const beforeIso = new Date(Date.now() - CANDIDATE_QUOTE_ATTEMPT_RETENTION_MS).toISOString();
+    const pruned = store.pruneCandidateQuoteAttempts(beforeIso);
+    if (pruned > 0) logger.info({ pruned, beforeIso }, 'pruned expired candidate quote-attempt telemetry');
+  };
+  pruneCandidateAttemptTelemetry();
+  const candidateTelemetryPruneTimer = setInterval(pruneCandidateAttemptTelemetry, 24 * 60 * 60 * 1000);
 
   // Quoting is gated on `degraded`, whose only durable home is sqlite. Wrap the store so a
   // failed flag write still stops the quoter via an in-process latch.
@@ -170,8 +180,9 @@ async function main(): Promise<void> {
       };
     },
   });
-  const candidateFingerprint = candidateStrategyFingerprint(cfg.candidate, {
+  const candidateFingerprint = candidateFingerprints(cfg.candidate, {
     jupiterMaxSlippageBps: cfg.jupiter.maxSlippageBps,
+    observerSampleCadenceMs: cfg.observer.sampleCadenceMs,
   });
   const candidateStartup = resolveCandidateApiKey(cfg.candidate);
   if (cfg.mode === 'observer' && cfg.candidate.enabled && !candidateStartup.canStart) {
@@ -213,8 +224,10 @@ async function main(): Promise<void> {
       disableOnProviderRateLimit: cfg.candidate.disableOnProviderRateLimit,
       providerRateLimitConsecutiveThreshold: cfg.candidate.providerRateLimitConsecutiveThreshold,
       providerRateLimitDefaultCooldownMs: cfg.candidate.providerRateLimitDefaultCooldownMs,
-      baselineWatchdogMs: cfg.candidate.baselineWatchdogMs,
-      activatedAtMs: activatedAt.getTime(),
+      baselineWatchdogMs: effectiveBaselineWatchdogMs(
+        cfg.candidate.baselineWatchdogMs,
+        cfg.observer.sampleCadenceMs,
+      ),
     });
     candidateGuard = guard;
 
@@ -237,7 +250,8 @@ async function main(): Promise<void> {
         httpStatus,
         rateLimit429Count,
         baselineSampleAgeMs: guard.baselineSampleAgeMs(startedAtMs),
-        strategyFingerprint: candidateFingerprint,
+        economicFingerprint: candidateFingerprint.economicFingerprint,
+        operationalFingerprint: candidateFingerprint.operationalFingerprint,
       });
     };
 
@@ -254,7 +268,8 @@ async function main(): Promise<void> {
     recordCandidateProviderFailure = recordProviderFailure;
 
     const engine = new CandidateFillEngine({
-      strategyFingerprint: candidateFingerprint,
+      economicFingerprint: candidateFingerprint.economicFingerprint,
+      operationalFingerprint: candidateFingerprint.operationalFingerprint,
       ladder: cfg.candidate.ladder,
         minAllInEdgeBps: cfg.candidate.minAllInEdgeBps,
         repriceThresholdBps: cfg.candidate.repriceThresholdBps,
@@ -311,10 +326,15 @@ async function main(): Promise<void> {
         );
       }
     });
-    store.setCandidateRuntimeState(candidateFingerprint, activatedAt.toISOString());
+    store.setCandidateRuntimeState(
+      candidateFingerprint.economicFingerprint,
+      candidateFingerprint.operationalFingerprint,
+      activatedAt.toISOString(),
+    );
     logger.info(
       {
-        strategyFingerprint: candidateFingerprint,
+        economicFingerprint: candidateFingerprint.economicFingerprint,
+        operationalFingerprint: candidateFingerprint.operationalFingerprint,
         jupiterBaseUrl: cfg.candidate.jupiterBaseUrl,
         maxQuoteCallsPerSec: cfg.candidate.maxQuoteCallsPerSec,
       },
@@ -487,6 +507,7 @@ async function main(): Promise<void> {
   const hedgeSweepTimer = setInterval(sweepHedges, STALE_HEDGE_MAX_AGE_MS);
 
   const observerTick = async (): Promise<void> => {
+    candidateGuard?.recordBaselineAttempt();
     const book = bookCache.snapshot();
     const bid = book.bids[0]?.price;
     const ask = book.asks[0]?.price;
@@ -506,7 +527,6 @@ async function main(): Promise<void> {
     const oracleTrusted = crossVenueTrust.trusted && bookAgeMs <= cfg.observer.maxBookAgeSec * 1000;
     const fee = await cex.feeTier();
     const paperCandidates: PaperQuoteCandidate[] = [];
-    let successfulSamples = 0;
     for (const rawSize of cfg.observer.sizesBert) {
       try {
         const sizeBert = new Decimal(rawSize);
@@ -523,7 +543,7 @@ async function main(): Promise<void> {
           sellMakerEdgeBps: e.sellMakerEdgeBps.toString(), dexSellImpactBps: e.dexSellImpactBps.toString(),
           dexBuyImpactBps: e.dexBuyImpactBps.toString(), bookAgeMs, oracleTrusted,
         });
-        successfulSamples += 1;
+        candidateGuard?.recordBaselineSuccess();
         const fixedCostBps = sizeBert.mul(mid.mid).gt(0)
           ? new Decimal(cfg.paper.transactionCostUsd).div(sizeBert.mul(mid.mid)).mul(10_000)
           : new Decimal(0);
@@ -542,7 +562,6 @@ async function main(): Promise<void> {
       }
     }
     if (cfg.paper.enabled) paper.updateQuotes(paperCandidates);
-    if (successfulSamples > 0) candidateGuard?.recordBaselineSuccess();
   };
   let observerTimer: NodeJS.Timeout | undefined;
   if (cfg.mode === 'observer') {
@@ -578,7 +597,11 @@ async function main(): Promise<void> {
       });
       candidateSnapshot = snapshot;
       candidate.recordRefreshSuccess();
-      store.insertCandidateSnapshot(snapshot, candidateFingerprint);
+      store.insertCandidateSnapshot(
+        snapshot,
+        candidateFingerprint.economicFingerprint,
+        candidateFingerprint.operationalFingerprint,
+      );
       recordCandidateAttempt('snapshot', startedAtMs, candidateSnapshotCallCount, 'success', 200, 0);
       candidateGuard.recordSnapshotSuccess();
     } catch (err) {
@@ -633,6 +656,7 @@ async function main(): Promise<void> {
     clearInterval(quoterTimer);
     clearInterval(hedgeSweepTimer);
     clearInterval(heartbeatTimer);
+    clearInterval(candidateTelemetryPruneTimer);
     if (observerTimer) clearInterval(observerTimer);
     if (candidateTimer) clearInterval(candidateTimer);
     wdLoop.stop();
