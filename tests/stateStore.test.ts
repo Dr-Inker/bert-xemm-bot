@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { StateStore } from '../src/stateStore.js';
+import Decimal from 'decimal.js';
 
 describe('StateStore', () => {
   let store: StateStore;
@@ -55,6 +56,72 @@ describe('StateStore', () => {
     const db = (store as unknown as { db: import('better-sqlite3').Database }).db;
     expect((db.prepare('SELECT status FROM paper_orders WHERE paper_order_id=?').get('po1') as {status:string}).status).toBe('filled');
     expect((db.prepare('SELECT net_pnl_usd FROM paper_fills WHERE paper_fill_id=?').get('pf1') as {net_pnl_usd:string}).net_pnl_usd).toBe('0.1264');
+  });
+
+  it('persists candidate trades, snapshots, queue remainders, dual-friction fills, and gate periods', () => {
+    const t = new Date('2026-08-03T00:00:00.000Z');
+    store.insertPublicTrades([{
+      tradeId: 101, side: 'sell', price: new Decimal('0.098'), volume: new Decimal(50), t,
+    }]);
+    store.insertPublicTrades([{
+      tradeId: 101, side: 'sell', price: new Decimal('0.098'), volume: new Decimal(50), t,
+    }]);
+    store.insertCandidateSnapshot({
+      asOf: t,
+      raydiumMidUsd: new Decimal('0.1'), solUsd: new Decimal(100),
+      krakenBid: new Decimal('0.099'), krakenAsk: new Decimal('0.101'),
+      crossVenueDivergenceBps: new Decimal(0),
+      book: { pair: 'BERT/USD', bids: [], asks: [], t },
+      references: new Map([['500', {
+        sizeBert: new Decimal(500), executableSellPriceUsd: new Decimal('0.1'), executableBuyPriceUsd: new Decimal('0.1'),
+        sellImpactBps: new Decimal(2), buyImpactBps: new Decimal(3),
+        sellRouteDeviationBps: new Decimal(0), buyRouteDeviationBps: new Decimal(0),
+      }]]),
+    }, t);
+    store.upsertCandidateOrder({
+      candidateOrderId: 'co1', rungIndex: 1, side: 'buy', distanceBps: '400', price: '0.09615',
+      sizeBert: '500', remainingBert: '450', queueAheadAtPlacementBert: '100', queueAheadRemainingBert: '0',
+      referencePriceUsd: '0.1', referenceImpactBps: '2', expectedGrossEdgeBps: '400',
+      expectedNormalNetEdgeBps: '342', expectedStressNetEdgeBps: '306',
+      economicSnapshotAt: t.toISOString(), placedAt: t.toISOString(), updatedAt: t.toISOString(),
+    });
+    store.closeCandidateOrder('co1', '450', t.toISOString(), 'cancel_on_fill');
+    store.upsertCandidateFill({
+      candidateFillId: 'cf1', candidateOrderId: 'co1', krakenTradeId: 101, hedgeBatchId: 'ch1', side: 'buy',
+      distanceBps: '400', fillPriceUsd: '0.09615', volumeBert: '50', orderRemainingBert: '450',
+      dexHedgePriceUsd: '0.1', dexImpactBps: '2', grossPnlUsd: '0.1925',
+      normalMakerFeeUsd: '0.011', normalLatencyCostUsd: '0.01', normalFailureReserveUsd: '0.005',
+      normalTransactionCostUsd: '0.02', normalNetPnlUsd: '0.1465',
+      stressMakerFeeUsd: '0.012', stressLatencyCostUsd: '0.02', stressFailureReserveUsd: '0.01',
+      stressTransactionCostUsd: '0.04', stressNetPnlUsd: '0.1105', hedgeStatus: 'pending',
+      economicsSource: 'placement_reference', hedgeResolvedAt: null, hedgeTerminalReason: null, t: t.toISOString(),
+    });
+    expect(store.listPendingCandidateFills()).toHaveLength(1);
+    store.abandonCandidateHedgeBatch('ch1', new Date(t.getTime() + 500).toISOString(), 'pending_hedge_expired');
+    store.syncCandidateGatePeriods([{ gate: 'route_gate_buy_500', detailJson: '{"deviationBps":"80"}' }], t.toISOString());
+    store.syncCandidateGatePeriods([], new Date(t.getTime() + 1000).toISOString());
+
+    const db = (store as unknown as { db: import('better-sqlite3').Database }).db;
+    expect((db.prepare('SELECT COUNT(*) n FROM public_trades').get() as { n: number }).n).toBe(1);
+    expect((db.prepare('SELECT remaining_bert,queue_ahead_at_placement_bert,close_reason FROM candidate_orders').get() as Record<string, string>))
+      .toMatchObject({ remaining_bert: '450', queue_ahead_at_placement_bert: '100', close_reason: 'cancel_on_fill' });
+    expect((db.prepare('SELECT normal_net_pnl_usd,stress_net_pnl_usd FROM candidate_fills').get() as Record<string, string>))
+      .toEqual({ normal_net_pnl_usd: '0.1465', stress_net_pnl_usd: '0.1105' });
+    expect((db.prepare('SELECT hedge_status,hedge_terminal_reason FROM candidate_fills').get() as Record<string, string>))
+      .toEqual({ hedge_status: 'abandoned', hedge_terminal_reason: 'pending_hedge_expired' });
+    expect((db.prepare('SELECT ended_at FROM candidate_gate_periods').get() as { ended_at: string }).ended_at).not.toBeNull();
+  });
+
+  it('enforces foreign keys and installs dashboard query indexes', () => {
+    const db = (store as unknown as { db: import('better-sqlite3').Database }).db;
+    expect(db.pragma('foreign_keys', { simple: true })).toBe(1);
+    expect(() => db.prepare(`INSERT INTO fills
+      (fill_id,order_cl_ord_id,side,price,volume,fee,t) VALUES ('orphan','missing','buy','1','1','0','2026-08-03T00:00:00Z')`).run())
+      .toThrow(/FOREIGN KEY/);
+    const orderIndexes = db.pragma('index_list(candidate_orders)') as Array<{ name: string }>;
+    const gateIndexes = db.pragma('index_list(candidate_gate_periods)') as Array<{ name: string }>;
+    expect(orderIndexes.map(index => index.name)).toContain('idx_candidate_orders_updated_at');
+    expect(gateIndexes.map(index => index.name)).toContain('idx_candidate_gate_started_at');
   });
 
   it('withTransaction rolls back on throw', () => {

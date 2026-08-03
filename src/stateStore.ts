@@ -1,6 +1,9 @@
 import Database from 'better-sqlite3';
 import type { Database as DB } from 'better-sqlite3';
 import Decimal from 'decimal.js';
+import type { CandidateFillRecord, CandidateOrder, CandidatePendingFill } from './candidateFillEngine.js';
+import type { CandidateEconomicSnapshot } from './candidateQuoteSampler.js';
+import type { PublicTrade } from './venues/krakenPublicTrades.js';
 
 export interface OrderRow {
   clOrdId: string;
@@ -34,6 +37,9 @@ export class StateStore {
   private db: DB;
   constructor(path: string) {
     this.db = new Database(path);
+    // Enforce the declared order/trade relationships on all new writes.
+    // Existing rows are not retroactively rejected by SQLite.
+    this.db.pragma('foreign_keys = ON');
     if (path !== ':memory:') this.db.pragma('journal_mode = WAL');
     this.migrate();
   }
@@ -105,6 +111,57 @@ export class StateStore {
         t TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_paper_fills_t ON paper_fills(t);
+      CREATE TABLE IF NOT EXISTS public_trades (
+        trade_id INTEGER PRIMARY KEY, t TEXT NOT NULL, price TEXT NOT NULL,
+        volume TEXT NOT NULL, side TEXT CHECK (side IN ('buy','sell')), received_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_public_trades_t ON public_trades(t);
+      CREATE TABLE IF NOT EXISTS candidate_snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, t TEXT NOT NULL, size_bert TEXT NOT NULL,
+        raydium_mid_usd TEXT NOT NULL, kraken_bid TEXT NOT NULL, kraken_ask TEXT NOT NULL,
+        cross_venue_divergence_bps TEXT NOT NULL, book_age_ms INTEGER NOT NULL,
+        executable_sell_price_usd TEXT NOT NULL, executable_buy_price_usd TEXT NOT NULL,
+        sell_route_deviation_bps TEXT NOT NULL, buy_route_deviation_bps TEXT NOT NULL,
+        sell_impact_bps TEXT NOT NULL, buy_impact_bps TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_candidate_snapshots_t_size ON candidate_snapshots(t, size_bert);
+      CREATE TABLE IF NOT EXISTS candidate_orders (
+        candidate_order_id TEXT PRIMARY KEY, rung_index INTEGER NOT NULL,
+        side TEXT NOT NULL CHECK (side IN ('buy','sell')), distance_bps TEXT NOT NULL,
+        price TEXT NOT NULL, size_bert TEXT NOT NULL, remaining_bert TEXT NOT NULL,
+        queue_ahead_at_placement_bert TEXT NOT NULL, queue_ahead_remaining_bert TEXT NOT NULL,
+        reference_price_usd TEXT NOT NULL, reference_impact_bps TEXT NOT NULL,
+        expected_gross_edge_bps TEXT NOT NULL, expected_normal_net_edge_bps TEXT NOT NULL,
+        expected_stress_net_edge_bps TEXT NOT NULL, economic_snapshot_at TEXT NOT NULL,
+        status TEXT NOT NULL, placed_at TEXT NOT NULL, updated_at TEXT NOT NULL, close_reason TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_candidate_orders_status ON candidate_orders(status);
+      CREATE INDEX IF NOT EXISTS idx_candidate_orders_updated_at ON candidate_orders(updated_at);
+      CREATE TABLE IF NOT EXISTS candidate_fills (
+        candidate_fill_id TEXT PRIMARY KEY, candidate_order_id TEXT NOT NULL,
+        kraken_trade_id INTEGER NOT NULL, hedge_batch_id TEXT NOT NULL,
+        side TEXT NOT NULL CHECK (side IN ('buy','sell')), distance_bps TEXT NOT NULL,
+        fill_price_usd TEXT NOT NULL, volume_bert TEXT NOT NULL, order_remaining_bert TEXT NOT NULL,
+        dex_hedge_price_usd TEXT NOT NULL, dex_impact_bps TEXT NOT NULL, gross_pnl_usd TEXT NOT NULL,
+        normal_maker_fee_usd TEXT NOT NULL, normal_latency_cost_usd TEXT NOT NULL,
+        normal_failure_reserve_usd TEXT NOT NULL, normal_transaction_cost_usd TEXT NOT NULL,
+        normal_net_pnl_usd TEXT NOT NULL, stress_maker_fee_usd TEXT NOT NULL,
+        stress_latency_cost_usd TEXT NOT NULL, stress_failure_reserve_usd TEXT NOT NULL,
+        stress_transaction_cost_usd TEXT NOT NULL, stress_net_pnl_usd TEXT NOT NULL,
+        hedge_status TEXT NOT NULL, economics_source TEXT NOT NULL,
+        hedge_resolved_at TEXT, hedge_terminal_reason TEXT, t TEXT NOT NULL,
+        FOREIGN KEY (candidate_order_id) REFERENCES candidate_orders(candidate_order_id),
+        FOREIGN KEY (kraken_trade_id) REFERENCES public_trades(trade_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_candidate_fills_t ON candidate_fills(t);
+      CREATE INDEX IF NOT EXISTS idx_candidate_fills_batch ON candidate_fills(hedge_batch_id);
+      CREATE TABLE IF NOT EXISTS candidate_gate_periods (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, gate TEXT NOT NULL, started_at TEXT NOT NULL,
+        ended_at TEXT, detail_json TEXT NOT NULL
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_candidate_gate_open
+        ON candidate_gate_periods(gate) WHERE ended_at IS NULL;
+      CREATE INDEX IF NOT EXISTS idx_candidate_gate_started_at ON candidate_gate_periods(started_at);
       CREATE TABLE IF NOT EXISTS kill_events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         t TEXT NOT NULL,
@@ -120,6 +177,8 @@ export class StateStore {
     // Idempotent column add for DBs created before bert_notional existed.
     // SQLite errors if the column is already present; swallow safely.
     try { this.db.exec("ALTER TABLE hedges ADD COLUMN bert_notional TEXT"); } catch { /* column already exists */ }
+    try { this.db.exec("ALTER TABLE candidate_fills ADD COLUMN hedge_resolved_at TEXT"); } catch { /* column already exists */ }
+    try { this.db.exec("ALTER TABLE candidate_fills ADD COLUMN hedge_terminal_reason TEXT"); } catch { /* column already exists */ }
   }
 
   insertOrder(r: OrderRow): void {
@@ -207,6 +266,163 @@ export class StateStore {
       VALUES (@paperFillId,@paperOrderId,@krakenTradeId,@side,@fillPriceUsd,@volumeBert,@dexHedgePriceUsd,
        @grossPnlUsd,@makerFeeUsd,@transactionCostUsd,@latencyCostUsd,@failureReserveUsd,@netPnlUsd,@dexImpactBps,@t)
     `).run(r);
+  }
+
+  insertPublicTrades(trades: PublicTrade[], receivedAt = new Date()): void {
+    const insert = this.db.prepare(`INSERT OR IGNORE INTO public_trades
+      (trade_id,t,price,volume,side,received_at) VALUES (@tradeId,@t,@price,@volume,@side,@receivedAt)`);
+    const receivedAtIso = receivedAt.toISOString();
+    this.withTransaction(() => {
+      for (const trade of trades) {
+        insert.run({
+          tradeId: trade.tradeId,
+          t: trade.t.toISOString(),
+          price: trade.price.toString(),
+          volume: trade.volume.toString(),
+          side: trade.side,
+          receivedAt: receivedAtIso,
+        });
+      }
+    });
+  }
+
+  insertCandidateSnapshot(snapshot: CandidateEconomicSnapshot, recordedAt = new Date()): void {
+    const insert = this.db.prepare(`INSERT INTO candidate_snapshots
+      (t,size_bert,raydium_mid_usd,kraken_bid,kraken_ask,cross_venue_divergence_bps,book_age_ms,
+       executable_sell_price_usd,executable_buy_price_usd,sell_route_deviation_bps,buy_route_deviation_bps,
+       sell_impact_bps,buy_impact_bps)
+      VALUES (@t,@sizeBert,@raydiumMidUsd,@krakenBid,@krakenAsk,@crossVenueDivergenceBps,@bookAgeMs,
+       @executableSellPriceUsd,@executableBuyPriceUsd,@sellRouteDeviationBps,@buyRouteDeviationBps,
+       @sellImpactBps,@buyImpactBps)`);
+    const bookAgeMs = Math.max(0, recordedAt.getTime() - snapshot.book.t.getTime());
+    this.withTransaction(() => {
+      for (const reference of snapshot.references.values()) {
+        insert.run({
+          t: snapshot.asOf.toISOString(),
+          sizeBert: reference.sizeBert.toString(),
+          raydiumMidUsd: snapshot.raydiumMidUsd.toString(),
+          krakenBid: snapshot.krakenBid.toString(),
+          krakenAsk: snapshot.krakenAsk.toString(),
+          crossVenueDivergenceBps: snapshot.crossVenueDivergenceBps.toString(),
+          bookAgeMs,
+          executableSellPriceUsd: reference.executableSellPriceUsd.toString(),
+          executableBuyPriceUsd: reference.executableBuyPriceUsd.toString(),
+          sellRouteDeviationBps: reference.sellRouteDeviationBps.toString(),
+          buyRouteDeviationBps: reference.buyRouteDeviationBps.toString(),
+          sellImpactBps: reference.sellImpactBps.toString(),
+          buyImpactBps: reference.buyImpactBps.toString(),
+        });
+      }
+    });
+  }
+
+  upsertCandidateOrder(r: CandidateOrder): void {
+    this.db.prepare(`INSERT INTO candidate_orders
+      (candidate_order_id,rung_index,side,distance_bps,price,size_bert,remaining_bert,
+       queue_ahead_at_placement_bert,queue_ahead_remaining_bert,reference_price_usd,reference_impact_bps,
+       expected_gross_edge_bps,expected_normal_net_edge_bps,expected_stress_net_edge_bps,
+       economic_snapshot_at,status,placed_at,updated_at)
+      VALUES (@candidateOrderId,@rungIndex,@side,@distanceBps,@price,@sizeBert,@remainingBert,
+       @queueAheadAtPlacementBert,@queueAheadRemainingBert,@referencePriceUsd,@referenceImpactBps,
+       @expectedGrossEdgeBps,@expectedNormalNetEdgeBps,@expectedStressNetEdgeBps,
+       @economicSnapshotAt,'open',@placedAt,@updatedAt)
+      ON CONFLICT(candidate_order_id) DO UPDATE SET
+       remaining_bert=excluded.remaining_bert,
+       queue_ahead_remaining_bert=excluded.queue_ahead_remaining_bert,
+       reference_price_usd=excluded.reference_price_usd,
+       reference_impact_bps=excluded.reference_impact_bps,
+       expected_gross_edge_bps=excluded.expected_gross_edge_bps,
+       expected_normal_net_edge_bps=excluded.expected_normal_net_edge_bps,
+       expected_stress_net_edge_bps=excluded.expected_stress_net_edge_bps,
+       economic_snapshot_at=excluded.economic_snapshot_at,
+       updated_at=excluded.updated_at`).run(r);
+  }
+
+  closeCandidateOrder(id: string, remainingBert: string, t: string, reason: string): void {
+    this.db.prepare(`UPDATE candidate_orders SET status=?,remaining_bert=?,close_reason=?,updated_at=?
+      WHERE candidate_order_id=? AND status='open'`)
+      .run(reason === 'filled' ? 'filled' : 'cancelled', remainingBert, reason, t, id);
+  }
+
+  cancelAllOpenCandidateOrders(t: string, reason: string): void {
+    this.db.prepare(`UPDATE candidate_orders SET status='cancelled',close_reason=?,updated_at=? WHERE status='open'`)
+      .run(reason, t);
+  }
+
+  upsertCandidateFill(r: CandidateFillRecord): void {
+    this.db.prepare(`INSERT INTO candidate_fills
+      (candidate_fill_id,candidate_order_id,kraken_trade_id,hedge_batch_id,side,distance_bps,
+       fill_price_usd,volume_bert,order_remaining_bert,dex_hedge_price_usd,dex_impact_bps,gross_pnl_usd,
+       normal_maker_fee_usd,normal_latency_cost_usd,normal_failure_reserve_usd,normal_transaction_cost_usd,
+       normal_net_pnl_usd,stress_maker_fee_usd,stress_latency_cost_usd,stress_failure_reserve_usd,
+       stress_transaction_cost_usd,stress_net_pnl_usd,hedge_status,economics_source,
+       hedge_resolved_at,hedge_terminal_reason,t)
+      VALUES (@candidateFillId,@candidateOrderId,@krakenTradeId,@hedgeBatchId,@side,@distanceBps,
+       @fillPriceUsd,@volumeBert,@orderRemainingBert,@dexHedgePriceUsd,@dexImpactBps,@grossPnlUsd,
+       @normalMakerFeeUsd,@normalLatencyCostUsd,@normalFailureReserveUsd,@normalTransactionCostUsd,
+       @normalNetPnlUsd,@stressMakerFeeUsd,@stressLatencyCostUsd,@stressFailureReserveUsd,
+       @stressTransactionCostUsd,@stressNetPnlUsd,@hedgeStatus,@economicsSource,
+       @hedgeResolvedAt,@hedgeTerminalReason,@t)
+      ON CONFLICT(candidate_fill_id) DO UPDATE SET
+       dex_hedge_price_usd=excluded.dex_hedge_price_usd,
+       dex_impact_bps=excluded.dex_impact_bps,
+       gross_pnl_usd=excluded.gross_pnl_usd,
+       normal_maker_fee_usd=excluded.normal_maker_fee_usd,
+       normal_latency_cost_usd=excluded.normal_latency_cost_usd,
+       normal_failure_reserve_usd=excluded.normal_failure_reserve_usd,
+       normal_transaction_cost_usd=excluded.normal_transaction_cost_usd,
+       normal_net_pnl_usd=excluded.normal_net_pnl_usd,
+       stress_maker_fee_usd=excluded.stress_maker_fee_usd,
+       stress_latency_cost_usd=excluded.stress_latency_cost_usd,
+       stress_failure_reserve_usd=excluded.stress_failure_reserve_usd,
+       stress_transaction_cost_usd=excluded.stress_transaction_cost_usd,
+       stress_net_pnl_usd=excluded.stress_net_pnl_usd,
+       hedge_status=excluded.hedge_status,
+       economics_source=excluded.economics_source,
+       hedge_resolved_at=excluded.hedge_resolved_at,
+       hedge_terminal_reason=excluded.hedge_terminal_reason`).run(r);
+  }
+
+  abandonCandidateHedgeBatch(batchId: string, t: string, reason: string): void {
+    this.db.prepare(`UPDATE candidate_fills
+      SET hedge_status='abandoned',hedge_resolved_at=?,hedge_terminal_reason=?
+      WHERE hedge_batch_id=? AND hedge_status='pending'`).run(t, reason, batchId);
+  }
+
+  listPendingCandidateFills(): CandidatePendingFill[] {
+    return this.db.prepare(`SELECT
+      f.candidate_fill_id AS candidateFillId,
+      f.candidate_order_id AS candidateOrderId,
+      f.kraken_trade_id AS krakenTradeId,
+      f.hedge_batch_id AS hedgeBatchId,
+      f.side,
+      f.distance_bps AS distanceBps,
+      f.fill_price_usd AS fillPriceUsd,
+      f.volume_bert AS volumeBert,
+      f.order_remaining_bert AS orderRemainingBert,
+      o.reference_price_usd AS referencePriceUsd,
+      o.reference_impact_bps AS referenceImpactBps,
+      f.t
+      FROM candidate_fills f
+      JOIN candidate_orders o ON o.candidate_order_id=f.candidate_order_id
+      WHERE f.hedge_status='pending'
+      ORDER BY f.t,f.candidate_fill_id`).all() as CandidatePendingFill[];
+  }
+
+  syncCandidateGatePeriods(gates: Array<{ gate: string; detailJson: string }>, t: string): void {
+    const active = new Map(gates.map(gate => [gate.gate, gate.detailJson]));
+    this.withTransaction(() => {
+      const open = this.db.prepare(`SELECT gate FROM candidate_gate_periods WHERE ended_at IS NULL`).all() as Array<{ gate: string }>;
+      const close = this.db.prepare(`UPDATE candidate_gate_periods SET ended_at=? WHERE gate=? AND ended_at IS NULL`);
+      const update = this.db.prepare(`UPDATE candidate_gate_periods SET detail_json=? WHERE gate=? AND ended_at IS NULL`);
+      const insert = this.db.prepare(`INSERT INTO candidate_gate_periods (gate,started_at,detail_json) VALUES (?,?,?)`);
+      for (const row of open) {
+        if (!active.has(row.gate)) close.run(t, row.gate);
+        else update.run(active.get(row.gate), row.gate);
+      }
+      const openNames = new Set(open.map(row => row.gate));
+      for (const [gate, detailJson] of active) if (!openNames.has(gate)) insert.run(gate, t, detailJson);
+    });
   }
 
   setFlag(key: string, value: string): void {

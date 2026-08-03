@@ -56,6 +56,39 @@ paper:
   failedHedgeReserveBps: 10
   transactionCostUsd: 0.02
 
+# Observer-only shadow-v2 lane. It is opt-in: existing deployments remain on
+# the comparison lane until enabled explicitly. Candidate Jupiter calls use a
+# dedicated maxRpcCallsPerSec limiter; existing observer/paper calls retain
+# their pre-shadow timing and do not share the candidate FIFO.
+candidate:
+  enabled: false
+  ladder:
+    - { sizeBert: 1000, distanceBps: 175 }
+    - { sizeBert: 500, distanceBps: 400 }
+    - { sizeBert: 500, distanceBps: 800 }
+  minAllInEdgeBps: 75
+  decisionCadenceMs: 1000
+  repriceThresholdBps: 10
+  maxQuoteAgeMs: 3000
+  crossVenueMaxBps: 150
+  routeVsReserveMaxBps: 75
+  maxBookAgeSec: 15
+  drift5sBps: 35
+  drift30sBps: 75
+  driftResumeStableSec: 30
+  maxPendingHedgeAgeMs: 120000
+  maxActivePerSideBert: 2000
+  normalFriction:
+    makerFeeBps: 23
+    latencyPenaltyBps: 20
+    failedHedgeReserveBps: 10
+    transactionCostUsd: 0.02
+  stressFriction:
+    makerFeeBps: 25
+    latencyPenaltyBps: 40
+    failedHedgeReserveBps: 20
+    transactionCostUsd: 0.04
+
 quoter:
   # Decision loop cadence (ms). Min 500, max 60_000.
   cadenceMs: 2500
@@ -98,7 +131,10 @@ watchdog:
 # Oracle: kill if two price sources diverge by more than this (bps).
 oracleDivergenceBps: 200
 
-# Global RPC rate limit (calls/sec) for the Solana side.
+# Solana-side operational ceiling. Shadow v2 also uses this value as its own
+# candidate-only Jupiter quote start-rate budget. It does not throttle the
+# baseline observer/paper lane, so total Jupiter demand is the candidate budget
+# plus whatever baseline sampling or fill hedges are active at that instant.
 maxRpcCallsPerSec: 5
 
 paths:
