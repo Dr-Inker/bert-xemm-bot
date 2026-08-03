@@ -2,7 +2,7 @@ import { writeFile } from 'node:fs/promises';
 import { logger } from './logger.js';
 import { Reconciler } from './risk/reconciler.js';
 import { HedgeExecutor } from './strategy/hedgeExecutor.js';
-import { KillSwitchWatchdog } from './risk/killSwitchWatchdog.js';
+import { KillSwitchWatchdog, failClosedEvaluate } from './risk/killSwitchWatchdog.js';
 import { QuoterLoop } from './orchestrator/quoterLoop.js';
 import { FillLoop } from './orchestrator/fillLoop.js';
 import { WatchdogLoop } from './orchestrator/watchdogLoop.js';
@@ -20,7 +20,6 @@ import { KrakenPublicTrades } from './venues/krakenPublicTrades.js';
 import {
   condNetDelta, condKraken24hMin, condSolUsd1hMove, condStaleData,
   condRpcBurn, condRaydium24hMin, condDailyPnl, condAdverseFill,
-  type KillResult,
 } from './risk/conditions.js';
 
 // Rolling 1h window of solUsd reads — feeds condSolUsd1hMove.
@@ -171,9 +170,8 @@ async function main(): Promise<void> {
     }
   })();
 
-  const evaluateConditions = async (): Promise<KillResult[]> => {
-    const out: KillResult[] = [];
-    try {
+  const evaluateConditions = failClosedEvaluate(
+    async (out) => {
       const mid = await dex.poolMidUsd();
       solUsdHist.record(mid.solUsd);
       const balances = await cex.balances();
@@ -216,11 +214,9 @@ async function main(): Promise<void> {
       ));
 
       // 8 of 8 conditions now wired.
-    } catch (err) {
-      logger.error({ err }, 'watchdog evaluate failed; returning empty (open)');
-    }
-    return out;
-  };
+    },
+    (err) => logger.error({ err }, 'watchdog evaluate failed; failing closed (synthetic kill)'),
+  );
 
   const watchdog = new KillSwitchWatchdog({
     store: {

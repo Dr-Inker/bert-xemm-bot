@@ -9,6 +9,7 @@ export interface HedgeRow {
   jupiterQuote: string | null;
   txSig: string | null;
   slippageRealized: string | null;
+  /** Signed BERT outflow of this hedge: positive = DEX sell-hedge, negative = DEX buy-hedge. */
   bertNotional: string;
   tIntent: string;
   tConfirmed: string | null;
@@ -16,6 +17,7 @@ export interface HedgeRow {
 
 export interface HedgeStore {
   writeHedge(row: HedgeRow): Promise<void>;
+  /** Signed net BERT outflow of all non-terminal hedges (positive = BERT leaving us). */
   readInFlight(): Promise<Decimal>;
   markConfirmed(hedgeId: string, txSig: string, slippageRealized: string): Promise<void>;
 }
@@ -55,9 +57,12 @@ export class HedgeExecutor {
       ? fill.volume
       : fill.volume.mul(fill.price).div(solUsd);
 
-    // BERT notional for in-flight inventory accounting: absolute BERT amount of the hedge.
-    // Sign is implicit in the triggering fill side; the tracker subtracts this magnitude.
-    const bertNotional = fill.volume.toString();
+    // BERT notional for in-flight inventory accounting, SIGNED as net BERT *outflow*:
+    //   buy fill  → we sell BERT on the DEX → BERT leaves us  → positive
+    //   sell fill → we buy BERT on the DEX  → BERT arrives    → negative
+    // NetDeltaTracker subtracts this signed quantity, so an in-flight hedge is counted
+    // as already settled in whichever direction it actually moves inventory.
+    const bertNotional = (dir.input === 'BERT' ? fill.volume : fill.volume.neg()).toString();
 
     await this.opts.store.writeHedge({
       hedgeId, triggeringFillId: fill.fillId, status: 'intent_queued',

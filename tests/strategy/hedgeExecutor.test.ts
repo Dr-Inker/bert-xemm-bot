@@ -82,6 +82,49 @@ describe('HedgeExecutor.onFill', () => {
     expect(parseFloat(amountIn.toFixed(4))).toBeCloseTo(0.2056, 3);
   });
 
+  it('buy fill → DEX sell-hedge writes a POSITIVE (outflow) bertNotional', async () => {
+    const dex = {
+      estimateSwap: vi.fn().mockResolvedValue({
+        inputAsset: 'BERT', outputAsset: 'SOL', amountIn: new Decimal('1000'),
+        expectedAmountOut: new Decimal('0.0045'), slippageBps: 50, priceImpactBps: 10, routeJson: '{}',
+      }),
+      submitSwap: vi.fn().mockResolvedValue('SIG-BUY'),
+    };
+    const store = { writeHedge: vi.fn(), readInFlight: vi.fn().mockResolvedValue(new Decimal('0')), markConfirmed: vi.fn() };
+    const exec = new HedgeExecutor({
+      dex: dex as never, store: store as never, notifier: { page: vi.fn() } as never,
+      maxDexSlippageBps: 100, jitoTipLamports: 10_000,
+    });
+    await exec.onFill(fill, new Decimal('86.12'));
+    expect(store.writeHedge).toHaveBeenCalledWith(expect.objectContaining({
+      status: 'intent_queued', bertNotional: '1000',
+    }));
+  });
+
+  it('sell fill → DEX buy-hedge writes a NEGATIVE (inflow) bertNotional', async () => {
+    const sellFill = {
+      fillId: 'F3', orderClOrdId: 'cl-3', side: 'sell' as const,
+      price: new Decimal('0.0177'), volume: new Decimal('1000'),
+      fee: new Decimal('0.0044'), t: new Date('2026-05-20T00:00:00Z'),
+    };
+    const dex = {
+      estimateSwap: vi.fn().mockResolvedValue({
+        inputAsset: 'SOL', outputAsset: 'BERT', amountIn: new Decimal('0.2056'),
+        expectedAmountOut: new Decimal('1000'), slippageBps: 50, priceImpactBps: 10, routeJson: '{}',
+      }),
+      submitSwap: vi.fn().mockResolvedValue('SIG-SELL2'),
+    };
+    const store = { writeHedge: vi.fn(), readInFlight: vi.fn().mockResolvedValue(new Decimal('0')), markConfirmed: vi.fn() };
+    const exec = new HedgeExecutor({
+      dex: dex as never, store: store as never, notifier: { page: vi.fn() } as never,
+      maxDexSlippageBps: 100, jitoTipLamports: 10_000,
+    });
+    await exec.onFill(sellFill, new Decimal('86.12'));
+    expect(store.writeHedge).toHaveBeenCalledWith(expect.objectContaining({
+      status: 'intent_queued', bertNotional: '-1000',
+    }));
+  });
+
   it('happy path: poll returns confirmed → markConfirmed called', async () => {
     vi.useFakeTimers();
     const dex = {

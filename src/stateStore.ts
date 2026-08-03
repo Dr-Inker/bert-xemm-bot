@@ -279,6 +279,11 @@ export class StateStore {
     this.db.prepare(`UPDATE hedges SET status=? WHERE hedge_id=?`).run(status, hedgeId);
   }
 
+  /**
+   * Signed net BERT outflow of non-terminal hedges. Rows carry a signed bert_notional
+   * (positive = DEX sell-hedge sending BERT out, negative = DEX buy-hedge bringing it in),
+   * so opposing in-flight hedges net against each other.
+   */
   sumInFlightHedgesBert(): Decimal {
     const rows = this.db.prepare(`
       SELECT bert_notional FROM hedges
