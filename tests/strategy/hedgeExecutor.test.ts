@@ -238,7 +238,7 @@ describe('HedgeExecutor.onFill', () => {
     vi.useRealTimers();
   });
 
-  it('retry path: 1 timeout then confirmed → 2 submissions, no dead-letter', async () => {
+  it('retry path: 1 definitive failure then confirmed → 2 submissions, no dead-letter', async () => {
     vi.useFakeTimers();
     const dex = {
       estimateSwap: vi.fn().mockResolvedValue({
@@ -256,8 +256,8 @@ describe('HedgeExecutor.onFill', () => {
       readInFlight: vi.fn().mockResolvedValue(new Decimal('0')),
       markConfirmed,
     };
-    // First sig: pending forever (times out). Second sig: confirmed.
-    const txStatus = vi.fn((sig: string) => Promise.resolve(sig === 'SIG-1' ? 'pending' : 'confirmed'));
+    // First sig: definitively failed on chain (safe to resubmit). Second sig: confirmed.
+    const txStatus = vi.fn((sig: string) => Promise.resolve(sig === 'SIG-1' ? 'failed' : 'confirmed'));
     const exec = new HedgeExecutor({
       dex: dex as never, store: store as never,
       notifier: { page: vi.fn() } as never,
@@ -271,6 +271,57 @@ describe('HedgeExecutor.onFill', () => {
     expect(transitions).toContain('failed_will_retry');
     expect(markConfirmed).toHaveBeenCalledWith(expect.any(String), 'SIG-2', '10');
     vi.useRealTimers();
+  });
+
+  it('confirmation TIMEOUT does not resubmit: dead-letters and pages to verify the tx', async () => {
+    vi.useFakeTimers();
+    const dex = {
+      estimateSwap: vi.fn().mockResolvedValue({
+        inputAsset: 'BERT', outputAsset: 'SOL', amountIn: new Decimal('1000'),
+        expectedAmountOut: new Decimal('0.0045'), slippageBps: 50, priceImpactBps: 10, routeJson: '{}',
+      }),
+      submitSwap: vi.fn().mockResolvedValue('SIG-PENDING'),
+    };
+    const transitions: string[] = [];
+    const store = {
+      writeHedge: vi.fn((r: { status: string }) => { transitions.push(r.status); }),
+      readInFlight: vi.fn().mockResolvedValue(new Decimal('0')),
+      markConfirmed: vi.fn(),
+    };
+    const notifier = { page: vi.fn() };
+    // Never resolves either way — the ambiguous case. Resubmitting here double-hedges.
+    const txStatus = vi.fn().mockResolvedValue('pending');
+    const exec = new HedgeExecutor({
+      dex: dex as never, store: store as never, notifier: notifier as never,
+      maxDexSlippageBps: 100, jitoTipLamports: 10_000,
+      txStatus, pollIntervalMs: 50, pollTimeoutMs: 200, maxRetries: 3,
+    });
+    const p = exec.onFill(fill, new Decimal('86.12'));
+    await vi.runAllTimersAsync();
+    await p;
+    expect(dex.submitSwap).toHaveBeenCalledTimes(1);
+    expect(transitions).not.toContain('failed_will_retry');
+    expect(transitions).toContain('failed_dead_letter');
+    expect(notifier.page).toHaveBeenCalledWith(expect.stringContaining('SIG-PENDING'));
+    expect(notifier.page).toHaveBeenCalledWith(expect.stringContaining('may still land'));
+    vi.useRealTimers();
+  });
+
+  it('pages when the initial intent row cannot even be written', async () => {
+    const dex = { estimateSwap: vi.fn(), submitSwap: vi.fn() };
+    const store = {
+      writeHedge: vi.fn().mockRejectedValue(new Error('sqlite locked')),
+      readInFlight: vi.fn().mockResolvedValue(new Decimal('0')),
+      markConfirmed: vi.fn(),
+    };
+    const notifier = { page: vi.fn() };
+    const exec = new HedgeExecutor({
+      dex: dex as never, store: store as never, notifier: notifier as never,
+      maxDexSlippageBps: 100, jitoTipLamports: 10_000,
+    });
+    await expect(exec.onFill(sellFillF9, new Decimal('86.12'))).rejects.toThrow('sqlite locked');
+    expect(dex.estimateSwap).not.toHaveBeenCalled();
+    expect(notifier.page).toHaveBeenCalledWith(expect.stringContaining('unhedged'));
   });
 
   it('dead-letter: 3 retries exhausted', async () => {

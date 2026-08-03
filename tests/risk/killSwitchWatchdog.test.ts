@@ -3,11 +3,12 @@ import { KillSwitchWatchdog, failClosedEvaluate } from '../../src/risk/killSwitc
 import type { KillResult } from '../../src/risk/conditions.js';
 
 function harness(evaluate: () => Promise<KillResult[]>) {
-  const store = { setFlag: vi.fn(), insertKillEvent: vi.fn() };
+  const store = { setFlag: vi.fn(), insertKillEvent: vi.fn(), latchDegraded: vi.fn() };
   const cex = { cancelAll: vi.fn().mockResolvedValue({ cancelled: 3 }) };
   const notifier = { page: vi.fn(), warn: vi.fn() };
-  const watchdog = new KillSwitchWatchdog({ store, cex, notifier, evaluate });
-  return { store, cex, notifier, watchdog };
+  const logger = { error: vi.fn() };
+  const watchdog = new KillSwitchWatchdog({ store, cex, notifier, evaluate, logger });
+  return { store, cex, notifier, logger, watchdog };
 }
 
 describe('failClosedEvaluate', () => {
@@ -104,6 +105,32 @@ describe('KillSwitchWatchdog fail-closed integration', () => {
     );
     notifier.page.mockImplementation(() => { throw new Error('discord webhook down'); });
     await expect(watchdog.tick()).resolves.toHaveLength(1);
+    expect(cex.cancelAll).toHaveBeenCalledTimes(1);
+  });
+
+  it('arms the in-memory latch before any fallible step', async () => {
+    const order: string[] = [];
+    const { store, cex, watchdog } = harness(
+      failClosedEvaluate(async () => { throw new Error('boom'); }, vi.fn()),
+    );
+    store.latchDegraded.mockImplementation(() => { order.push('latch'); });
+    store.setFlag.mockImplementation(() => { order.push('degraded'); throw new Error('disk full'); });
+    store.insertKillEvent.mockImplementation(() => { order.push('event'); });
+    cex.cancelAll.mockImplementation(() => { order.push('cancel'); return Promise.resolve({ cancelled: 0 }); });
+    await watchdog.tick();
+    expect(order[0]).toBe('latch');
+    expect(order).toContain('cancel');
+  });
+
+  it('a throwing logger does not abort the remaining safety steps', async () => {
+    const { store, cex, notifier, logger, watchdog } = harness(
+      failClosedEvaluate(async () => { throw new Error('boom'); }, vi.fn()),
+    );
+    store.setFlag.mockImplementation(() => { throw new Error('disk full'); });
+    logger.error.mockImplementation(() => { throw new Error('logger transport closed'); });
+    await expect(watchdog.tick()).resolves.toHaveLength(1);
+    expect(store.insertKillEvent).toHaveBeenCalled();
+    expect(notifier.page).toHaveBeenCalled();
     expect(cex.cancelAll).toHaveBeenCalledTimes(1);
   });
 

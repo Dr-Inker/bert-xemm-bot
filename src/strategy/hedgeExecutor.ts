@@ -64,12 +64,6 @@ export class HedgeExecutor {
     // as already settled in whichever direction it actually moves inventory.
     const bertNotional = (dir.input === 'BERT' ? fill.volume : fill.volume.neg()).toString();
 
-    await this.opts.store.writeHedge({
-      hedgeId, triggeringFillId: fill.fillId, status: 'intent_queued',
-      jupiterQuote: null, txSig: null, slippageRealized: null,
-      bertNotional, tIntent, tConfirmed: null,
-    });
-
     let attempt = 0;
     const maxRetries = this.opts.maxRetries ?? 3;
     let lastQuote: SwapQuote | null = null;
@@ -78,8 +72,16 @@ export class HedgeExecutor {
     // Everything below runs against a row that sumInFlightHedgesBert() counts as in-flight,
     // i.e. as good as settled. If any step throws, that row would sit non-terminal forever
     // and the tracker would report a flat book while the Kraken leg is genuinely unhedged —
-    // so the catch drives the row to a terminal status before rethrowing.
+    // so the catch drives the row to a terminal status before rethrowing. The intent write
+    // is inside the try as well: if it fails we never hedge at all, which is the same
+    // exposure and equally deserves a page.
     try {
+      await this.opts.store.writeHedge({
+        hedgeId, triggeringFillId: fill.fillId, status: 'intent_queued',
+        jupiterQuote: null, txSig: null, slippageRealized: null,
+        bertNotional, tIntent, tConfirmed: null,
+      });
+
       while (attempt <= maxRetries) {
         const quote = await this.opts.dex.estimateSwap(dir.input, dir.output, amountIn);
         lastQuote = quote;
@@ -116,7 +118,22 @@ export class HedgeExecutor {
           return;
         }
 
-        // failed or pending-past-timeout → mark for retry
+        if (status === 'timeout') {
+          // AMBIGUOUS: the tx may still land. Resubmitting here is how one Kraken fill
+          // turns into two DEX hedges, so stop and hand it to a human instead.
+          await this.opts.store.writeHedge({
+            hedgeId, triggeringFillId: fill.fillId, status: 'failed_dead_letter',
+            jupiterQuote: quote.routeJson, txSig: sig, slippageRealized: null,
+            bertNotional, tIntent, tConfirmed: null,
+          });
+          this.opts.notifier.page(
+            `hedge ${hedgeId} confirmation timed out; tx ${sig} may still land, verify before acting — ` +
+            `not resubmitting (would double-hedge); ${bertNotional} BERT from fill ${fill.fillId}`,
+          );
+          return;
+        }
+
+        // Definitively failed on chain → safe to retry.
         attempt += 1;
         if (attempt > maxRetries) break;
         await this.opts.store.writeHedge({
@@ -150,7 +167,12 @@ export class HedgeExecutor {
     }
   }
 
-  private async pollUntilTerminal(sig: string): Promise<'confirmed'|'failed'> {
+  /**
+   * 'failed' means the chain definitively rejected the tx (safe to resubmit).
+   * 'timeout' means we simply stopped hearing back — the tx may yet land, so the two
+   * must never be conflated: only the former may be retried.
+   */
+  private async pollUntilTerminal(sig: string): Promise<'confirmed'|'failed'|'timeout'> {
     if (!this.opts.txStatus) {
       // No status function configured (tests without confirmation flow) → treat as confirmed
       // so behavior matches v0 expectations.
@@ -165,6 +187,6 @@ export class HedgeExecutor {
       if (s === 'failed') return 'failed';
       await new Promise(r => setTimeout(r, interval));
     }
-    return 'failed';
+    return 'timeout';
   }
 }

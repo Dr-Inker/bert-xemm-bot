@@ -13,10 +13,16 @@ import { logger } from '../logger.js';
 export const FEE_TIER_FALLBACK_MAKER_BPS = 25;
 export const FEE_TIER_FALLBACK_TAKER_BPS = 40;
 
-/** Kraken reports fees as percent strings. Returns null for anything not finite and >= 0. */
+/**
+ * Kraken reports fees as percent strings. Validates the WHOLE string: parseFloat('0garbage')
+ * is 0, which would read as a free maker fee and wave through unprofitable quotes.
+ * Returns null unless the entire value parses to a finite, non-negative number.
+ */
 function parseFeePct(raw: string | undefined): number | null {
   if (raw === undefined) return null;
-  const v = parseFloat(raw);
+  const trimmed = raw.trim();
+  if (trimmed === '') return null;
+  const v = Number(trimmed);
   return Number.isFinite(v) && v >= 0 ? v : null;
 }
 

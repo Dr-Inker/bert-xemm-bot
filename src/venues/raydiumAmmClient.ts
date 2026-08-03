@@ -19,7 +19,10 @@ export interface SolRefAdapter {
 }
 
 export interface TxSubmitter {
-  submitProtected(serializedTx: string, opts: { jito: boolean; tipLamports: number }): Promise<string>;
+  submitProtected(
+    serializedTx: string,
+    opts: { jito: boolean; tipLamports: number },
+  ): Promise<{ txSig: string; bundleId?: string }>;
 }
 
 export class RaydiumAmmClient implements DexVenue {
@@ -69,7 +72,9 @@ export class RaydiumAmmClient implements DexVenue {
   async submitSwap(quote: SwapQuote, opts: { jito: boolean; tipLamports: number }): Promise<string> {
     const q = JSON.parse(quote.routeJson) as QuoteResp;
     const built = await jupiterBuildSwap(this.jupiterBaseUrl, q, this.hotWalletPubkey);
-    return this.submitter.submitProtected(built.swapTransaction, opts);
+    // Confirmation polling needs the tx signature, never the Jito bundle id.
+    const res = await this.submitter.submitProtected(built.swapTransaction, opts);
+    return res.txSig;
   }
 
   async walletBalances(): Promise<{ bert: Decimal; sol: Decimal }> {

@@ -3,6 +3,8 @@ import { logger } from './logger.js';
 import { Reconciler } from './risk/reconciler.js';
 import { HedgeExecutor } from './strategy/hedgeExecutor.js';
 import { KillSwitchWatchdog, failClosedEvaluate } from './risk/killSwitchWatchdog.js';
+import { createDegradedGate } from './risk/degradedGate.js';
+import { sweepStaleHedges, STALE_HEDGE_MAX_AGE_MS } from './risk/hedgeSweeper.js';
 import { QuoterLoop } from './orchestrator/quoterLoop.js';
 import { FillLoop } from './orchestrator/fillLoop.js';
 import { WatchdogLoop } from './orchestrator/watchdogLoop.js';
@@ -68,11 +70,28 @@ async function main(): Promise<void> {
   const { cfg, store, cex, dex, notifier, connection, rpcCounter } = wireVenues();
   logger.info({ mode: cfg.mode, enabled: cfg.enabled }, 'startup');
 
+  // Quoting is gated on `degraded`, whose only durable home is sqlite. Wrap the store so a
+  // failed flag write still stops the quoter via an in-process latch.
+  const degradedGate = createDegradedGate(store);
+
+  // Recovery sweep: any hedge row stuck non-terminal is counted as settled by the in-flight
+  // sum, so bound how long that can lie — once at startup, then on a timer.
+  const sweepHedges = (): void => {
+    const swept = sweepStaleHedges({
+      store,
+      notifier: { page: (m) => { void notifier.critical(m); } },
+      logger,
+    });
+    if (swept > 0) logger.error({ swept }, 'stale hedge sweep force-dead-lettered rows');
+  };
+  sweepHedges();
+
   const reconciler = new Reconciler({
     cex,
     store: {
       listOpenOrders: async () => store.listOpenOrders(),
-      setFlag: (k, v) => store.setFlag(k, v),
+      // Through the gate: a reconciler halt must survive a failed durable write too.
+      setFlag: (k, v) => degradedGate.setFlag(k, v),
     },
     notifier: { page: (m) => { void notifier.critical(m); } },
   });
@@ -220,8 +239,9 @@ async function main(): Promise<void> {
 
   const watchdog = new KillSwitchWatchdog({
     store: {
-      setFlag: (k, v) => store.setFlag(k, v),
+      setFlag: (k, v) => degradedGate.setFlag(k, v),
       insertKillEvent: (r) => store.insertKillEvent(r),
+      latchDegraded: () => degradedGate.latchDegraded(),
     },
     cex,
     notifier: {
@@ -233,7 +253,13 @@ async function main(): Promise<void> {
   });
 
   const quoter = new QuoterLoop({
-    cex, store,
+    cex,
+    store: {
+      insertBasisSample: (r) => store.insertBasisSample(r),
+      insertOrder: (r) => store.insertOrder(r),
+      // Reads through the latch, so a kill halts quoting even if the flag write failed.
+      getFlag: (k) => degradedGate.getFlag(k),
+    },
     executeIntents: cfg.mode === 'live',
     readInputs: async () => {
       const mid = await dex.poolMidUsd();
@@ -286,6 +312,8 @@ async function main(): Promise<void> {
   const quoterTimer = setInterval(() => {
     quoter.tick().catch(e => logger.error({ err: e }, 'quoter tick'));
   }, cfg.quoter.cadenceMs);
+
+  const hedgeSweepTimer = setInterval(sweepHedges, STALE_HEDGE_MAX_AGE_MS);
 
   const observerTick = async (): Promise<void> => {
     const book = bookCache.snapshot();
@@ -364,6 +392,7 @@ async function main(): Promise<void> {
   process.on('SIGINT', () => {
     logger.info('SIGINT received, shutting down');
     clearInterval(quoterTimer);
+    clearInterval(hedgeSweepTimer);
     clearInterval(heartbeatTimer);
     if (observerTimer) clearInterval(observerTimer);
     wdLoop.stop();

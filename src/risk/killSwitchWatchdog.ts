@@ -4,6 +4,8 @@ import type { Logger } from '../logger.js';
 export interface WatchdogStore {
   setFlag(key: string, value: string): void;
   insertKillEvent(row: { t: string; conditionId: number; snapshotJson: string; actionTaken: KillAction }): void;
+  /** In-process degraded latch, used when the durable setFlag cannot be trusted to land. */
+  latchDegraded?(): void;
 }
 
 export interface WatchdogVenue {
@@ -65,7 +67,11 @@ export class KillSwitchWatchdog {
     try {
       await fn();
     } catch (err) {
-      this.opts.logger?.error({ err, step }, 'watchdog kill step failed; continuing');
+      // The logger is itself a fallible dependency (closed transport, full pipe). If it
+      // threw here it would abort every remaining safety step, so it gets its own guard.
+      try {
+        this.opts.logger?.error({ err, step }, 'watchdog kill step failed; continuing');
+      } catch { /* nothing left to log with */ }
     }
   }
 
@@ -73,6 +79,11 @@ export class KillSwitchWatchdog {
     const results = await this.opts.evaluate();
     const tripped = results.filter(r => r.tripped);
     if (tripped.length === 0) return [];
+
+    // The in-memory latch goes first and outside attempt(): it touches neither disk nor
+    // network, so it is the one step that essentially cannot fail, and it is what the
+    // quoter gate ORs against when the durable write below does not land.
+    try { this.opts.store.latchDegraded?.(); } catch { /* must never block the kill path */ }
 
     // Order matters: latch local state and raise the alarm FIRST, then reach out to the
     // venue. cancelAll is the step most likely to fail (network, venue 5xx) and a failure

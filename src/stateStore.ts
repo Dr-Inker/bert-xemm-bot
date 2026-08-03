@@ -280,6 +280,21 @@ export class StateStore {
   }
 
   /**
+   * Non-terminal hedge rows whose intent predates `cutoffIso` — rows the in-flight sum still
+   * trusts but which can no longer plausibly be in flight. Feeds the recovery sweep.
+   */
+  listStaleInFlightHedges(cutoffIso: string): Array<{ hedgeId: string; bertNotional: string | null; tIntent: string; status: string }> {
+    const rows = this.db.prepare(`
+      SELECT hedge_id, bert_notional, t_intent, status FROM hedges
+      WHERE status IN ('intent_queued','swap_quoted','tx_submitted','failed_will_retry')
+        AND t_intent < ?
+    `).all(cutoffIso) as Array<{ hedge_id: string; bert_notional: string | null; t_intent: string; status: string }>;
+    return rows.map(r => ({
+      hedgeId: r.hedge_id, bertNotional: r.bert_notional, tIntent: r.t_intent, status: r.status,
+    }));
+  }
+
+  /**
    * Signed net BERT outflow of non-terminal hedges. Rows carry a signed bert_notional
    * (positive = DEX sell-hedge sending BERT out, negative = DEX buy-hedge bringing it in),
    * so opposing in-flight hedges net against each other.

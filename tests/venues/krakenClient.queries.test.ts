@@ -67,6 +67,19 @@ describe('KrakenClient queries', () => {
     warn.mockRestore();
   });
 
+  it('feeTier rejects numeric-prefix garbage rather than reading it as a 0 bps fee', async () => {
+    vi.spyOn(exec, 'execFileNoThrow').mockResolvedValue({
+      stdout: JSON.stringify({ fees: { BERTUSD: { fee_maker: '0garbage', fee: '0.26' } } }), stderr: '', status: 0,
+    });
+    const warn = vi.spyOn(logger, 'warn').mockImplementation((() => undefined) as never);
+    const c = new KrakenClient(cfg);
+    const t = await c.feeTier();
+    // parseFloat('0garbage') === 0 → a free maker fee → fail-open cheap quoting.
+    expect(t.makerBps).toBe(25);
+    expect(t.takerBps).toBe(40);
+    warn.mockRestore();
+  });
+
   it('openOrders parses array correctly', async () => {
     vi.spyOn(exec, 'execFileNoThrow').mockResolvedValue({
       stdout: JSON.stringify({
