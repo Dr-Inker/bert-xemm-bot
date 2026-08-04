@@ -7,15 +7,17 @@ This project complements `/opt/bert-mm-bot`; it does not replace it:
 - `bert-mm-bot` manages on-chain BERT/SOL liquidity.
 - `bert-xemm-bot` measures and, only after explicit promotion, can quote Kraken and hedge on-chain.
 
-## Current status — 2026-07-26
+## Current status — 2026-08-04
 
 - Deployed in `observer` mode with no exchange credentials, wallet loading, orders, or capital.
-- Samples executable hedge economics at 1,000, 5,000, and 10,000 BERT every 30 seconds.
-- Uses Kraken's public entry fee schedule (currently 23 bps maker) and Jupiter executable quotes.
-- Runs a conservative local paper-fill ledger from Kraken public trades and estimated queue-ahead volume.
-- Publishes sanitized, read-only telemetry every minute at <https://drinkerlabs.info/bert-mm/>.
+- Two research lanes run side by side:
+  - **Baseline** (since 2026-07-26): executable hedge economics at 1,000/5,000/10,000 BERT every 30 seconds on the keyless Jupiter endpoint, plus the conservative paper-fill ledger. Unchanged, for series continuity.
+  - **Candidate "shadow v2"** (since 2026-08-03 18:06 UTC): the two-key-approved candidate strategy — ladder 1000 BERT @175 bps / 500 @400 / 500 @800 per side off fresh executable Jupiter references, 75 bps minimum all-in edge, 1 s decisions, 3 s snapshot TTL, drift/route/book gates, allocation-once fill model against real public trades, dual normal+stress friction accounting — collecting go/no-go evidence on a keyed `api.jup.ag` endpoint.
+- The candidate lane passed its 2-hour soak (zero provider 429s, p99 snapshot construction 357 ms, max baseline sampling gap 34 s). The 14-day evidence window runs from 2026-08-03T18:06:56Z; go/no-go review due ~2026-08-17.
+- The candidate lane self-latches off on provider throttling or baseline-sampler starvation and never queues catch-up bursts.
+- Publishes sanitized, read-only telemetry every minute at <https://drinkerlabs.info/bert-mm/>, including a `candidate` section filtered by economic strategy fingerprint.
 
-The observer and paper ledger cannot place real orders. `live` mode exists in the codebase but is not approved for capital.
+The observer, paper ledger, and candidate lane cannot place real orders. `live` mode exists in the codebase but is not approved for capital; promotion requires the documented go/no-go bar, restricted Kraken keys, and explicit two-key approval.
 
 ## What theoretical P&L means
 
@@ -73,7 +75,7 @@ paper:
   transactionCostUsd: 0.02
 
 candidate:
-  enabled: false
+  enabled: false   # production /etc config sets true; requires JUPITER_API_KEY (see docs/DEPLOY.md)
   jupiterBaseUrl: https://api.jup.ag/swap/v1
   apiKeyEnv: JUPITER_API_KEY
   maxQuoteCallsPerSec: 6

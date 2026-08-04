@@ -46,6 +46,43 @@ sudo systemctl start bert-xemm-dashboard-export.service
 
 The static dashboard page is served from `/var/www/drinkerlabs/bert-mm/`. The exporter reads SQLite in read-only mode and atomically publishes sanitized JSON there once per minute.
 
+## Candidate lane (shadow v2, keyed Jupiter)
+
+The candidate evidence lane is disabled by default and requires a keyed Jupiter
+endpoint. It must never run keyless: the shared per-IP budget on the free tier
+starves the baseline lane (observed 2026-08-03).
+
+1. Install the API key (never commit it, never put it in config.yaml):
+
+```bash
+sudo install -m 640 -o root -g bertxemm /dev/null /etc/bert-xemm-bot/secrets.env
+echo 'JUPITER_API_KEY=<key>' | sudo tee /etc/bert-xemm-bot/secrets.env >/dev/null
+sudo mkdir -p /etc/systemd/system/bert-xemm-bot.service.d
+printf '[Service]\nEnvironmentFile=/etc/bert-xemm-bot/secrets.env\n' | sudo tee /etc/systemd/system/bert-xemm-bot.service.d/secrets.conf >/dev/null
+sudo systemctl daemon-reload
+```
+
+2. Verify the key's tier before enabling: the strategy needs ~4.2 sustained QPS
+   aggregate; probe `x-ratelimit-*` headers (a 100-per-10 s window = 10 QPS is
+   the verified-sufficient shape). Keyed-free (1 RPS) is insufficient.
+
+3. Set `candidate.enabled: true` in `/etc/bert-xemm-bot/config.yaml` and restart.
+   With a missing/empty key the lane refuses to start and the baseline is
+   unaffected.
+
+4. Soak gate before trusting evidence — over the first 2 hours require:
+   zero 429s (`SUM(rate_limit_429_count)` in `candidate_quote_attempts`),
+   p99 `duration_ms` under 1000, no baseline sampling gap beyond
+   3 × `observer.sampleCadenceMs`, and no latch. The lane latches itself off
+   (process lifetime) after 3 consecutive 429s or 45 s+ of baseline starvation;
+   a latch survives until restart by design.
+
+Evidence separation: every snapshot/order/fill carries an economic and an
+operational fingerprint. The dashboard and any go/no-go analysis must filter by
+the economic fingerprint so parameter changes cannot silently mix evidence.
+Known disclosed bias: same-price refreshes never replenish queue-ahead, so
+candidate fill rates lean optimistic — treat marginal GO results skeptically.
+
 ## Post-deploy verification
 
 ```bash
